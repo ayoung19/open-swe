@@ -9,13 +9,35 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
-	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
+// BedrockClient implements the same interface as AnthropicClient but uses AWS Bedrock
 type BedrockClient struct {
-	client *bedrockruntime.Client
-	model  string
-	region string
+	client  *bedrockruntime.Client
+	model   string
+	region  string
+}
+
+// BedrockRequest matches Anthropic's API format for easier compatibility
+type BedrockRequest struct {
+	AnthropicVersion string             `json:"anthropic_version"`
+	MaxTokens        int                `json:"max_tokens"`
+	Messages         []AnthropicMessage `json:"messages"`
+	System           string             `json:"system,omitempty"`
+	Tools            []Tool             `json:"tools,omitempty"`
+}
+
+// BedrockResponse matches Anthropic's response format
+type BedrockResponse struct {
+	ID      string            `json:"id"`
+	Type    string            `json:"type"`
+	Role    string            `json:"role"`
+	Content []json.RawMessage `json:"content"`
+	Model   string            `json:"model"`
+	Usage   struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
 }
 
 func NewBedrockClient() *BedrockClient {
@@ -38,165 +60,57 @@ func NewBedrockClient() *BedrockClient {
 	}
 }
 
+// CreateMessage sends a message to Bedrock using the same interface as AnthropicClient
 func (c *BedrockClient) CreateMessage(messages []AnthropicMessage, system string, tools []Tool) (*AnthropicResponse, error) {
-	// Convert our messages to Bedrock format
-	var converseMessages []types.Message
-	
-	for _, msg := range messages {
-		bedrockMsg := types.Message{
-			Role: types.ConversationRole(msg.Role),
-		}
-
-		// Handle different content types
-		switch content := msg.Content.(type) {
-		case []interface{}:
-			var msgContent []types.ContentBlock
-			for _, item := range content {
-				switch v := item.(type) {
-				case TextContent:
-					msgContent = append(msgContent, &types.ContentBlockMemberText{
-						Value: v.Text,
-					})
-				case ToolResultContent:
-					msgContent = append(msgContent, &types.ContentBlockMemberToolResult{
-						Value: types.ToolResultBlock{
-							ToolUseId: aws.String(v.ToolUseID),
-							Content: []types.ToolResultContentBlock{
-								&types.ToolResultContentBlockMemberText{
-									Value: types.ToolResultContentBlockText{
-										Text: aws.String(v.Content),
-									},
-								},
-							},
-							Status: func() types.ToolResultStatus {
-								if v.IsError {
-									return types.ToolResultStatusError
-								}
-								return types.ToolResultStatusSuccess
-							}(),
-						},
-					})
-				}
-			}
-			bedrockMsg.Content = msgContent
-		case []json.RawMessage:
-			// This is from assistant responses
-			var msgContent []types.ContentBlock
-			text, toolCalls, _ := c.ParseContent(content)
-			
-			if text != "" {
-				msgContent = append(msgContent, &types.ContentBlockMemberText{
-					Value: text,
-				})
-			}
-			
-			for _, toolCall := range toolCalls {
-				inputJSON, _ := json.Marshal(toolCall.Input)
-				msgContent = append(msgContent, &types.ContentBlockMemberToolUse{
-					Value: types.ToolUseBlock{
-						ToolUseId: aws.String(toolCall.ID),
-						Name:      aws.String(toolCall.Name),
-						Input:     aws.JSONValue(inputJSON),
-					},
-				})
-			}
-			bedrockMsg.Content = msgContent
-		}
-
-		if len(bedrockMsg.Content) > 0 {
-			converseMessages = append(converseMessages, bedrockMsg)
-		}
+	// Build the request in Anthropic format
+	req := BedrockRequest{
+		AnthropicVersion: "bedrock-2023-05-31",
+		MaxTokens:        8192,
+		Messages:         messages,
+		System:           system,
+		Tools:            tools,
 	}
 
-	// Convert tools to Bedrock format
-	var bedrockTools []types.Tool
-	if len(tools) > 0 {
-		for _, tool := range tools {
-			inputSchema, _ := json.Marshal(tool.InputSchema)
-			bedrockTools = append(bedrockTools, &types.ToolMemberToolSpec{
-				Value: types.ToolSpecification{
-					Name:        aws.String(tool.Name),
-					Description: aws.String(tool.Description),
-					InputSchema: &types.ToolInputSchemaMemberJson{
-						Value: aws.JSONValue(inputSchema),
-					},
-				},
-			})
-		}
-	}
-
-	// Build the request
-	input := &bedrockruntime.ConverseInput{
-		ModelId:  aws.String(c.model),
-		Messages: converseMessages,
-		InferenceConfig: &types.InferenceConfiguration{
-			MaxTokens: aws.Int32(8192),
-		},
-	}
-
-	if system != "" {
-		input.System = []types.SystemContentBlock{
-			&types.SystemContentBlockMemberText{
-				Value: system,
-			},
-		}
-	}
-
-	if len(bedrockTools) > 0 {
-		input.ToolConfig = &types.ToolConfiguration{
-			Tools: bedrockTools,
-		}
-	}
-
-	// Make the API call
-	resp, err := c.client.Converse(context.TODO(), input)
+	// Marshal the request
+	jsonData, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("bedrock converse error: %w", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Convert response back to our format
-	var responseContent []json.RawMessage
-	
-	for _, content := range resp.Output.Message.Content {
-		switch v := content.(type) {
-		case *types.ContentBlockMemberText:
-			textContent := map[string]interface{}{
-				"type": "text",
-				"text": v.Value,
-			}
-			raw, _ := json.Marshal(textContent)
-			responseContent = append(responseContent, raw)
-			
-		case *types.ContentBlockMemberToolUse:
-			var inputMap map[string]interface{}
-			if v.Value.Input != nil {
-				json.Unmarshal(v.Value.Input, &inputMap)
-			}
-			
-			toolContent := ToolUseContent{
-				Type:  "tool_use",
-				ID:    aws.ToString(v.Value.ToolUseId),
-				Name:  aws.ToString(v.Value.Name),
-				Input: inputMap,
-			}
-			raw, _ := json.Marshal(toolContent)
-			responseContent = append(responseContent, raw)
-		}
+	// Call Bedrock InvokeModel API
+	input := &bedrockruntime.InvokeModelInput{
+		ModelId:     aws.String(c.model),
+		ContentType: aws.String("application/json"),
+		Accept:      aws.String("application/json"),
+		Body:        jsonData,
 	}
 
+	resp, err := c.client.InvokeModel(context.TODO(), input)
+	if err != nil {
+		return nil, fmt.Errorf("bedrock invoke error: %w", err)
+	}
+
+	// Parse the response
+	var bedrockResp BedrockResponse
+	if err := json.Unmarshal(resp.Body, &bedrockResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	// Convert to AnthropicResponse format
 	return &AnthropicResponse{
-		ID:      "bedrock-" + aws.ToString(resp.ResponseMetadata.RequestID),
-		Type:    "message",
-		Role:    string(resp.Output.Message.Role),
-		Content: responseContent,
+		ID:      bedrockResp.ID,
+		Type:    bedrockResp.Type,
+		Role:    bedrockResp.Role,
+		Content: bedrockResp.Content,
 		Model:   c.model,
 		Usage: Usage{
-			InputTokens:  int(aws.ToInt32(resp.Usage.InputTokens)),
-			OutputTokens: int(aws.ToInt32(resp.Usage.OutputTokens)),
+			InputTokens:  bedrockResp.Usage.InputTokens,
+			OutputTokens: bedrockResp.Usage.OutputTokens,
 		},
 	}, nil
 }
 
+// ParseContent parses the response content - same implementation as AnthropicClient
 func (c *BedrockClient) ParseContent(content []json.RawMessage) (string, []ToolUseContent, error) {
 	var text string
 	var toolCalls []ToolUseContent

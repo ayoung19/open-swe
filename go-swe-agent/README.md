@@ -1,13 +1,20 @@
 # Go SWE Agent
 
-A simplified autonomous coding agent written in Go that can plan and execute complex coding tasks on any codebase.
+A simplified autonomous coding agent written in Go that can plan and execute complex coding tasks on any codebase. Uses AWS Bedrock with Claude 3 Opus for superior reasoning capabilities.
 
 ## Features
 
 - 🔍 **Automatic Codebase Analysis**: Explores and understands your project structure
-- 📋 **Intelligent Planning**: Creates step-by-step plans for complex tasks
+- 📋 **Intelligent Planning**: Creates step-by-step plans for complex tasks using Claude 3 Opus
 - 🔧 **Autonomous Execution**: Executes tasks using file operations and shell commands
 - 🎯 **Focused Simplicity**: Minimal dependencies, maximum effectiveness
+- ☁️ **AWS Bedrock Integration**: Leverages enterprise-grade AI infrastructure
+
+## Prerequisites
+
+1. **AWS Account** with Amazon Bedrock access
+2. **Claude 3 Opus** model enabled in your AWS Bedrock console
+3. **AWS CLI** configured with appropriate credentials
 
 ## Installation
 
@@ -23,12 +30,29 @@ go mod download
 go build -o go-swe-agent cmd/main.go
 ```
 
-## Usage
+## Setup
 
-### Set your Anthropic API key:
+### Configure AWS Credentials:
+
+#### Option 1: Environment Variables
 ```bash
-export ANTHROPIC_API_KEY=your-api-key-here
+export AWS_ACCESS_KEY_ID=your-access-key
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+export AWS_REGION=us-west-2  # Optional, defaults to us-west-2
 ```
+
+#### Option 2: AWS CLI Configuration
+```bash
+aws configure
+```
+
+### Enable Claude 3 Opus in AWS Bedrock:
+1. Go to AWS Bedrock console
+2. Navigate to Model access
+3. Request access to "Claude 3 Opus" (anthropic.claude-3-opus-20240229)
+4. Wait for approval (usually instant for Claude models)
+
+## Usage
 
 ### Run the agent:
 ```bash
@@ -102,14 +126,16 @@ go-swe-agent/
 ## Requirements
 
 - Go 1.21 or higher
-- Anthropic API key
+- AWS Account with Bedrock access
+- Claude 3 Opus model enabled in AWS Bedrock
 - Unix-like environment (Linux, macOS, WSL)
 
 ## Limitations
 
-- Currently only supports Anthropic's Claude API
+- Currently only supports AWS Bedrock with Claude 3 Opus
 - Requires environment with bash shell
 - No built-in rollback mechanism (use version control)
+- AWS region must have Bedrock available
 
 ## Contributing
 

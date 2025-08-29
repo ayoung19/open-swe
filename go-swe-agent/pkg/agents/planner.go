@@ -11,13 +11,13 @@ import (
 )
 
 type Planner struct {
-	client       *llm.AnthropicClient
+	client       *llm.BedrockClient
 	toolExecutor *tools.ToolExecutor
 }
 
 func NewPlanner(workingDir string) *Planner {
 	return &Planner{
-		client:       llm.NewAnthropicClient(),
+		client:       llm.NewBedrockClient(),
 		toolExecutor: tools.NewToolExecutor(workingDir),
 	}
 }

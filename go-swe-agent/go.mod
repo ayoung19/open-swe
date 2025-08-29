@@ -3,6 +3,9 @@ module github.com/openswe/go-swe-agent
 go 1.21
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.24.0
+	github.com/aws/aws-sdk-go-v2/config v1.26.0
+	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.8.0
 	github.com/fatih/color v1.16.0
 	github.com/spf13/cobra v1.8.0
 )

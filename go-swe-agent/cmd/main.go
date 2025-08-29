@@ -42,11 +42,16 @@ Example:
 }
 
 func runAgent(cmd *cobra.Command, args []string) {
-	// Check for API key
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		color.Red("Error: ANTHROPIC_API_KEY environment variable is required\n")
-		fmt.Println("\nPlease set your Anthropic API key:")
-		fmt.Println("  export ANTHROPIC_API_KEY=your-api-key")
+	// Check for AWS credentials
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" || os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
+		color.Red("Error: AWS credentials are required\n")
+		fmt.Println("\nPlease configure your AWS credentials:")
+		fmt.Println("  export AWS_ACCESS_KEY_ID=your-access-key")
+		fmt.Println("  export AWS_SECRET_ACCESS_KEY=your-secret-key")
+		fmt.Println("  export AWS_REGION=us-west-2  # Optional, defaults to us-west-2")
+		fmt.Println("\nOr configure using AWS CLI:")
+		fmt.Println("  aws configure")
+		fmt.Println("\nMake sure your AWS account has access to Amazon Bedrock with Claude 3 Opus model.")
 		os.Exit(1)
 	}
 

@@ -11,13 +11,13 @@ import (
 )
 
 type Executor struct {
-	client       *llm.AnthropicClient
+	client       *llm.BedrockClient
 	toolExecutor *tools.ToolExecutor
 }
 
 func NewExecutor(workingDir string) *Executor {
 	return &Executor{
-		client:       llm.NewAnthropicClient(),
+		client:       llm.NewBedrockClient(),
 		toolExecutor: tools.NewToolExecutor(workingDir),
 	}
 }

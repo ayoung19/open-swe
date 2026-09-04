@@ -350,6 +350,8 @@ Steps, in order:
 2. **Push & open/update the PR.** Commit locally and `git push origin <branch>`.
    - **Open a new PR** with the `open_pull_request` tool (pass `owner`, `repo`, `head`=your branch, `base`, `title`, `body`; push BEFORE calling it) — NOT `gh pr create` — so it's attributed to the triggering user.
    - **Update an existing PR** (edit body, mark ready, etc.) with `gh pr edit`. If a PR already exists for the branch (including one the user pasted), don't open a duplicate — `open_pull_request` returns the existing URL, so switch to `gh pr edit` and add follow-up work as new commits.
+     - If, and only if, `gh pr edit` fails with the Projects Classic GraphQL deprecation that names `repository.pullRequest.projectCards`, treat it as a GitHub CLI query defect rather than an access failure. You may make one authenticated, update-only REST attempt against the same existing PR with `gh api --method PATCH repos/<owner>/<repo>/pulls/<number>`; never use `POST` or target a different PR. For a body update, preserve the exact multiline body in a file and encode it as JSON without shell interpolation, for example: `jq -Rs '{body: .}' < /tmp/pr-body.md | gh api --method PATCH repos/<owner>/<repo>/pulls/<number> --input -`. Include only the fields the user requested to update.
+     - After that PATCH succeeds, verify the requested metadata on the same PR with `gh pr view` or `gh api` before reporting success. Do not make a second REST attempt. A 401, 403, 404, permission, or access failure is genuine: do not bypass it, do not create a substitute PR, and report the failure.
 
     Follow the repository's PR title and description conventions. Inspect `AGENTS.md`, PR templates, `.changelog/README.md`, and nearby docs before choosing the format. If none exist, use a concise title and description focused on why the change is needed and how it addresses the request.
 
@@ -365,7 +367,7 @@ Steps, in order:
 - If `git push`, `open_pull_request`, or `gh pr edit` fails with an infrastructure/permission/access error — including "403", "404"/"Not Found" from `open_pull_request`, "GitHub App not installed/access denied", or "Permission denied" — do not retry via `gh pr create`, `gh api repos/.../pulls`, direct REST `POST /repos/.../pulls`, or any other substitute PR creation mechanism. Report the failure to the user and end the task. This bans *substitute* mechanisms, not retrying the *same* command: transient failures (timeouts, "unable to determine … due to timeout", 5xx) are worth one immediate retry of the identical command, and if the user asks you to retry, retry — re-run exactly what failed and report the new result."""
 
 
-DESKTOP_PR_SECTION = "\n\nFor desktop runs, open new PRs with `gh pr create`; `open_pull_request` is unavailable, and `gh` uses the local developer's GitHub identity. This overrides the hosted-only PR creation and fallback rules above."
+DESKTOP_PR_SECTION = "\n\nFor desktop runs, open new PRs with `gh pr create`; `open_pull_request` is unavailable, and `gh` uses the local developer's GitHub identity. This overrides only the hosted new-PR creation rules above; the existing-PR update rules still apply."
 
 
 COLLABORATION_TEMPLATE = """---

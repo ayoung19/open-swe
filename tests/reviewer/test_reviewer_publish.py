@@ -847,6 +847,7 @@ async def test_publish_review_matches_comment_ids_by_marker_not_path_line_body()
     )
 
     with (
+        patch("openswe.tools.publish_review.FindingPublication.record", AsyncMock()) as recorded,
         patch("openswe.tools.publish_review.get_thread_id_from_runtime", return_value="tid"),
         patch("openswe.tools.publish_review.list_findings_async", AsyncMock(return_value=findings)),
         patch("openswe.tools.publish_review.post_pull_request_review", post_review),
@@ -868,12 +869,15 @@ async def test_publish_review_matches_comment_ids_by_marker_not_path_line_body()
             token="t",
             severity_threshold="medium",
             is_re_review=False,
+            invocation_id="originating-review",
         )
 
     assert result["success"] is True
     by_id = {f["id"]: f for f in findings}
     assert by_id["f_one"]["github_review_comment_ids"] == [901]
     assert by_id["f_two"]["github_review_comment_ids"] == [902]
+
+    assert recorded.await_args.args == ("o", "r", 7, "tid", "originating-review", [901, 902])
 
 
 @pytest.mark.asyncio

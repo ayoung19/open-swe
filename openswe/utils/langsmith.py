@@ -11,7 +11,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from langsmith import AsyncClient as AsyncLangSmithClient
 from langsmith import Client as LangSmithClient
-from langsmith.utils import LangSmithNotFoundError, get_host_url
+from langsmith.utils import LangSmithConflictError, LangSmithNotFoundError, get_host_url
 
 from openswe.config import ENV
 from openswe.utils.tracing import tracing_project
@@ -59,6 +59,70 @@ class LangSmithErrorLink:
 class LangSmithLocator:
     kind: Literal["thread", "run"]
     id: str
+
+    @staticmethod
+    async def review_trace_id(thread_id: str, invocation_id: str) -> str | None:
+        client = _build_langsmith_client()
+        project_id = await _resolve_project_id_by_name(tracing_project()) if client else None
+        if client is None or project_id is None:
+            raise LangSmithCostUnavailable("LangSmith tracing is unavailable")
+        for field in ("invocation_id", "prepare_run_id"):
+            runs = client.runs.query(
+                project_ids=[project_id],
+                filter=(
+                    f"and({_langsmith_metadata_filter('thread_id', thread_id)}, "
+                    f"{_langsmith_metadata_filter(field, invocation_id)})"
+                ),
+                selects=["TRACE_ID"],
+                min_start_time=datetime(1970, 1, 1, tzinfo=UTC),
+            )
+            ids = {str(run.trace_id) async for run in runs if run.trace_id}
+            if len(ids) == 1:
+                return ids.pop()
+            if ids:
+                raise ValueError("Multiple traces match a review invocation")
+        return None
+
+    @staticmethod
+    async def finding_feedback(trace_id: str, comment_id: int, score: int) -> None:
+        client = _build_langsmith_client()
+        if client is None:
+            raise LangSmithCostUnavailable("LangSmith tracing is unavailable")
+        feedback_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{trace_id}:{comment_id}:finding_thumbs_up")
+        comment = f"github_comment:{comment_id}"
+        try:
+            run = await client.read_run(trace_id)
+        except LangSmithNotFoundError:
+            logger.info("Review trace is unavailable", extra={"trace_id": trace_id})
+            return
+        try:
+            await client.read_feedback(feedback_id)
+        except LangSmithNotFoundError:
+            try:
+                await client.create_feedback(
+                    run_id=trace_id,
+                    session_id=run.session_id,
+                    start_time=run.start_time,
+                    key="finding_thumbs_up",
+                    score=score,
+                    comment=comment,
+                    feedback_id=feedback_id,
+                )
+                return
+            except LangSmithConflictError:
+                logger.debug(
+                    "Finding feedback was created concurrently", extra={"comment_id": comment_id}
+                )
+            except LangSmithNotFoundError:
+                logger.info("Review trace is unavailable", extra={"trace_id": trace_id})
+                return
+        await _update_feedback(
+            ENV.LANGSMITH_API_KEY.get(),
+            ENV.LANGSMITH_ENDPOINT.get(),
+            feedback_id,
+            score=score,
+            comment=comment,
+        )
 
 
 class LangSmithCostUnavailable(RuntimeError):

@@ -68,6 +68,7 @@ from openswe.review.publish import (
     resolve_review_thread,
     settle_review_check_run,
 )
+from openswe.review.reaction_feedback import FindingPublication
 from openswe.review.reconcile import reconcile_findings_with_review_threads
 from openswe.review.shadow import ReviewShadow
 from openswe.run_config import RunConfig
@@ -160,6 +161,7 @@ async def publish_review(
             severity_threshold=severity_threshold,
             is_re_review=is_re_review,
             langgraph_run_id=_current_run_id(config),
+            invocation_id=cfg.invocation_id,
             trace_link_config_override=cfg.review_trace_link_enabled,
             state=state,
             assessment=assessment,
@@ -313,6 +315,7 @@ async def _publish_review_async(
     severity_threshold: Severity,
     is_re_review: bool,
     langgraph_run_id: str | None = None,
+    invocation_id: str | None = None,
     trace_link_config_override: bool | None = None,
     state: dict[str, Any] | None = None,
     assessment: ReviewAssessment | None = None,
@@ -708,6 +711,22 @@ async def _publish_review_async(
             pr_number=pr_number,
             token=token,
         )
+
+        if invocation_id:
+            published_findings = await list_findings_async(thread_id)
+            await FindingPublication.record(
+                owner,
+                repo,
+                pr_number,
+                thread_id,
+                invocation_id,
+                [
+                    comment_id
+                    for finding in published_findings
+                    if finding.get("github_review_id") == review_id
+                    for comment_id in comment_ids_for_finding(finding)
+                ],
+            )
 
     resolved_thread_count = await _resolve_threads_for_resolved_findings(
         owner=owner,

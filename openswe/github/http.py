@@ -980,6 +980,9 @@ class RepoClient:
             raise ValueError("GitHub answered the new pull request without an object")
         return payload
 
+    async def review_comment_reactions(self, comment_id: int) -> list[dict[str, object]]:
+        return await self.pages(f"pulls/comments/{comment_id}/reactions")
+
     async def delete_review_comment(self, comment_id: int) -> None:
         await self.delete(f"pulls/comments/{comment_id}")
 

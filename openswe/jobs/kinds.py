@@ -55,6 +55,7 @@ from openswe.plugins.records import (
 
 __all__ = ["WORKER"]
 from openswe.reconcile import reconcile_stale_runs
+from openswe.review.reaction_feedback import REACTION_JOB, REACTION_SWEEP, FindingPublication
 from openswe.review_guide.sessions import ARCHIVE_JOB as REVIEW_GUIDE_ARCHIVE
 from openswe.review_guide.sessions import ReviewGuideSession
 from openswe.sandboxes.retry import (
@@ -86,6 +87,8 @@ _FIRE_CLAIM_TTL: Final = timedelta(days=2)
 SEGMENT_WORKER: Final = JobWorker(max_in_flight=2)
 SEGMENT_WORKER.register(SEGMENT_JOB)(SegmentDelivery.deliver)
 WORKER.register(MERGE_QUEUE_RECONCILE)(reconcile_queue)
+WORKER.register(REACTION_JOB)(FindingPublication.run)
+WORKER.register(REACTION_SWEEP)(FindingPublication.daily)
 WORKER.register(REQUIRED_CHECK_REFRESH)(refresh_required_checks)
 WORKER.register(GITHUB_QUOTA_SAMPLE)(InstallationQuota.sample)
 WORKER.register("event_subscription_timeout")(EventSubscription.wake_on_timeout)
@@ -280,6 +283,7 @@ async def notification_fallback(job: Job) -> None:
 async def start_jobs() -> None:
     """Startup work: move old scheduler crons over, and keep the standing jobs in place."""
     steps: list[Callable[[], Awaitable[object]]] = [
+        lambda: queue.schedule(REACTION_SWEEP, cron="0 0 * * *", key=REACTION_SWEEP),
         import_agent_server_crons,
         import_agent_server_threads,
         start_queue,

@@ -45,6 +45,7 @@ from openswe.review.findings import (
     ReviewerSlackThread,
     reviewer_thread_title,
 )
+from openswe.review.reaction_feedback import FindingPublication
 from openswe.review.reconcile import reconcile_linked_findings
 from openswe.review.shadow import ReviewShadow
 from openswe.run_config import Repo, RunConfig
@@ -579,6 +580,11 @@ async def process_github_pr_close(payload: dict[str, Any]) -> None:
     pr_number = pull_request.get("number")
     if not pr_number or not isinstance(pr_number, int):
         return
+
+    if payload.get("action") == "closed":
+        await FindingPublication.schedule_close(
+            repo_config["owner"], repo_config["name"], pr_number
+        )
 
     thread_id = await index.current_thread_id(
         reviewer_thread_id(repo_config.get("owner", ""), repo_config.get("name", ""), pr_number)

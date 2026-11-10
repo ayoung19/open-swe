@@ -597,6 +597,7 @@ async def test_pr_close_disables_watch() -> None:
         captured.append((thread_id, kwargs))
 
     with (
+        patch("openswe.review.reaction_feedback.queue.schedule", AsyncMock()) as scheduled,
         patch(
             "openswe.webhooks.common.is_repo_auto_review_enabled",
             new_callable=AsyncMock,
@@ -610,6 +611,10 @@ async def test_pr_close_disables_watch() -> None:
         patch("openswe.webhooks.common.set_reviewer_thread_metadata", side_effect=fake_set),
     ):
         await github_webhooks.process_github_pr_close(_pr_close_payload(action="closed"))
+    assert scheduled.await_args.args == (
+        "review_finding_reactions",
+        {"owner": "lc", "repo": "repo", "number": 7},
+    )
     auto_review_enabled.assert_not_awaited()
     assert captured and captured[0][1]["watch"] is False
 

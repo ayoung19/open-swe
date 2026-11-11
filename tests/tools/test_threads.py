@@ -11,9 +11,14 @@ from fastapi import HTTPException
 
 from openswe import run_config
 from openswe.claude_code.hooks import mirror_thread_id
-from openswe.input_messages import human_input, person_introduction
+from openswe.input_messages import human_input, person_introduction, system_input
 from openswe.message_queue import QueuedMessage
 from openswe.slack import allowed_bots
+from openswe.tasks import service as task_service
+from openswe.tasks import store as task_store
+from openswe.tasks.schemas import ThreadMetadata
+from openswe.users import User
+from openswe.workspaces.rows import WorkspaceRow
 
 threads_tool = importlib.import_module("openswe.tools.threads")
 slack_channels = importlib.import_module("openswe.slack.tools.channels")
@@ -1225,3 +1230,133 @@ async def test_public_worker_can_only_reply_to_its_owners_relaying_private_threa
             "status_code": 403,
         }
         proxy.assert_not_awaited()
+
+
+class TestSystemCoordinatorWorkers:
+    @pytest.mark.parametrize(
+        "sender", ["system:monitor", "system:background-task", "system:event-subscription"]
+    )
+    @pytest.mark.parametrize("target", ["own", "cross-owner", "unrelated", "other-coordinator"])
+    async def test_message_and_manage_worker(
+        self, monkeypatch: pytest.MonkeyPatch, sender: str, target: str
+    ) -> None:
+        coordinator = str(uuid.uuid4())
+        worker = str(uuid.uuid4())
+        owner = User()
+        other = User()
+        metadata = {
+            coordinator: ThreadMetadata(
+                owner_type="user", owner_user_id=owner.id, workspace="default"
+            ),
+            worker: ThreadMetadata(
+                owner_type="user",
+                owner_user_id=other.id if target == "cross-owner" else owner.id,
+                workspace="default",
+            ),
+        }
+        task = task_store.Task(
+            title="Robin task", workspace_id=uuid.uuid4(), coordinator_thread_id=coordinator
+        )
+        task.workspace = WorkspaceRow(slug="default", name="Default")
+        delegation = task_store.TaskDelegation(
+            worker_thread_id=worker,
+            task_id=task.id,
+            coordinator_thread_id=str(uuid.uuid4())
+            if target == "other-coordinator"
+            else coordinator,
+            instructions="Check the fix",
+            model="openai:gpt-6-astra",
+            effort="low",
+        )
+        contexts = {
+            coordinator: task_store.TaskContext(
+                task,
+                task_store.TaskMembership(
+                    thread_id=coordinator, task_id=task.id, role="coordinator"
+                ),
+            ),
+            worker: task_store.TaskContext(
+                task, task_store.TaskMembership(thread_id=worker, task_id=task.id, role="worker")
+            ),
+        }
+        config = {"configurable": {"thread_id": coordinator}}
+        monkeypatch.setattr(task_service, "get_config", lambda: config)
+        monkeypatch.setattr(threads_tool, "get_config", lambda: config)
+        monkeypatch.setattr(
+            task_service, "thread_metadata", AsyncMock(side_effect=metadata.__getitem__)
+        )
+        monkeypatch.setattr(
+            User, "get", AsyncMock(side_effect={owner.id: owner, other.id: other}.get)
+        )
+        monkeypatch.setattr(
+            task_store.TaskMembership, "context_for_thread", AsyncMock(side_effect=contexts.get)
+        )
+        monkeypatch.setattr(
+            task_store.TaskDelegation,
+            "get",
+            AsyncMock(return_value=None if target == "unrelated" else delegation),
+        )
+        monkeypatch.setattr(
+            task_service.presentation, "sender_label", AsyncMock(return_value="Coordinator")
+        )
+        recorded = AsyncMock(return_value=True)
+        monkeypatch.setattr(task_service, "record_event", recorded)
+        monkeypatch.setattr(task_service.TaskMessage, "deliver", AsyncMock(return_value=True))
+        cancelled = AsyncMock()
+        monkeypatch.setattr(task_service, "cancel_worker", cancelled)
+        monkeypatch.setattr(
+            task_service, "worker_status", AsyncMock(return_value={"worker_thread_id": worker})
+        )
+        monkeypatch.setattr(
+            task_service,
+            "enforce_github_login_gate",
+            AsyncMock(side_effect=AssertionError("No person credentials")),
+        )
+        monkeypatch.setattr(
+            task_service.ThreadIdentity,
+            "authorize",
+            AsyncMock(side_effect=AssertionError("No person credentials")),
+        )
+        state: dict[str, object] = {
+            "messages": [
+                system_input(
+                    "New test results", {"sender_id": sender, "surface": "web", "kind": "system"}
+                )
+            ]
+        }
+
+        if target != "own":
+            with pytest.raises(PermissionError):
+                await task_service.message_task_thread(state, "Tests passed", "update", worker)
+            with pytest.raises(PermissionError):
+                await task_service.control_worker(state, worker, "cancel")
+            actor = await task_service.Actor.resolve(state)
+            with pytest.raises(PermissionError, match="require its owner"):
+                await actor.authorize_owner(worker, metadata[worker])
+            recorded.assert_not_awaited()
+            cancelled.assert_not_awaited()
+            return
+
+        result = await task_service.message_task_thread(state, "Tests passed", "update", worker)
+        assert result == {"success": True, "recipient_thread_id": worker}
+        assert recorded.await_args is not None
+        assert recorded.await_args.args[1] == worker
+        assert "Tests passed" in recorded.await_args.args[3]
+        managed = await task_service.control_worker(state, worker, "cancel")
+        assert managed == {"worker_thread_id": worker, "cancellation_requested": True}
+        cancelled.assert_awaited_once_with(worker)
+
+    @pytest.mark.parametrize("identity", ["github_login", "user_id", "user_email"])
+    async def test_unresolved_person_cannot_fall_back_to_thread_owner(
+        self, monkeypatch: pytest.MonkeyPatch, identity: str
+    ) -> None:
+        thread_id = str(uuid.uuid4())
+        monkeypatch.setattr(
+            task_service,
+            "get_config",
+            lambda: {"configurable": {"thread_id": thread_id, identity: "revoked"}},
+        )
+        monkeypatch.setattr(task_service, "resolve_thread_actor", AsyncMock(return_value=None))
+        actor = await task_service.Actor.resolve({})
+        with pytest.raises(PermissionError, match="require its owner"):
+            await actor.authorize_owner(thread_id, ThreadMetadata(owner_type="user"))

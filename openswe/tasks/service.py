@@ -57,36 +57,45 @@ ASYNC_WORKER_SUBAGENT = "general-purpose"
 
 @dataclass(frozen=True)
 class Actor:
-    """A run operating on its own thread, which the backend-signed run token binds it to.
-
-    ``login`` is the person the run acts for; a system-owned thread's run may have none.
-    """
+    """A run bound to its thread, acting for a person or only its own task."""
 
     thread_id: str
     login: str | None = None
     email: str | None = None
+    owner_user_id: UUID | None = None
 
     @classmethod
     async def resolve(cls, state: Actor | dict[str, object]) -> Actor:
         if isinstance(state, Actor):
             return state
-        thread_id = get_config().get("configurable", {}).get("thread_id")
+        configurable = get_config().get("configurable", {})
+        thread_id = configurable.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
             raise PermissionError("Task operations require the run's thread")
         person = await resolve_thread_actor(state)
         if person is None:
+            if not any(configurable.get(key) for key in ("github_login", "user_id", "user_email")):
+                metadata = await thread_metadata(thread_id)
+                if metadata.owner_type == "user":
+                    owner = await metadata.owner()
+                    return cls(thread_id=thread_id, owner_user_id=owner.id)
             return cls(thread_id=thread_id)
         return cls(thread_id=thread_id, login=person.login, email=person.email)
 
     async def authorize_owner(
         self, thread_id: str, metadata: ThreadMetadata, *, allow_participants: bool = False
     ) -> None:
-        """A user-owned thread acts only for its owner, so nobody uses another's credentials.
-
-        ``allow_participants`` also admits a verified participant of the thread, with
-        read/post access checked against the owner's metadata; the participant still
-        never acts as anyone but themselves.
-        """
+        """Authorize the person, or a system run operating on its own same-owner workers."""
+        if not self.login and self.owner_user_id is not None:
+            own = metadata if thread_id == self.thread_id else await thread_metadata(self.thread_id)
+            owner = await own.owner()
+            target_owner = await metadata.owner()
+            if owner.id == self.owner_user_id == target_owner.id:
+                if thread_id == self.thread_id:
+                    return
+                delegation = await store.TaskDelegation.get(thread_id)
+                if delegation is not None and delegation.coordinator_thread_id == self.thread_id:
+                    return
         if not self.login:
             raise PermissionError("Task operations on a user-owned thread require its owner")
         identity = ThreadIdentity(self.login)
@@ -126,14 +135,7 @@ async def thread_metadata(thread_id: str) -> ThreadMetadata:
 async def authorized_metadata(
     actor: Actor, thread_id: str | None = None, *, allow_participants: bool = False
 ) -> ThreadMetadata:
-    """A task thread's metadata, once the actor's run may operate on it.
-
-    Every thread of a task has its coordinator's owner. A user-owned thread is
-    operated only by a run acting for that person. A system-owned thread acts as
-    the GitHub App, for no person: its own run is authorized by the run token that
-    binds the run to it, and another thread's run only by sharing its task.
-    ``allow_participants`` admits a verified participant on the actor's own thread only.
-    """
+    """Authorize thread access for a person or a system run bound to its own task."""
     own = await thread_metadata(actor.thread_id)
     if own.owner_type == "system":
         if own.visibility != "public":

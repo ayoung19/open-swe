@@ -1431,6 +1431,8 @@ async def steer_running_thread(
         payload["source"] = DASHBOARD_SOURCE
     if not await queue_message_for_thread(thread_id, payload):
         raise HTTPException(502, "failed to deliver the follow-up to the running agent")
+    if not relayed_from:
+        await THREADS.update(thread_id, {"source": DASHBOARD_SOURCE})
     # The run may have ended between the busy check and the store write, past
     # the completion hook's own look at the store. ``reject`` keeps the two
     # from racing each other into a second run.

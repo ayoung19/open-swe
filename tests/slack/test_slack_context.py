@@ -121,6 +121,7 @@ def test_upsert_stamps_visibility_and_owner_only_on_creation(
     assert created["visibility"] == "private"
     assert created["owner_login"] == "Alice"
 
+    threads.thread["metadata"]["source"] = "dashboard"
     asyncio.run(
         webhook_common.upsert_agent_thread_metadata(
             "thread-id", source="slack", visibility="public", owner_login="bob", title="Thread"
@@ -129,6 +130,7 @@ def test_upsert_stamps_visibility_and_owner_only_on_creation(
     metadata = cast(dict, threads.thread)["metadata"]
     assert metadata["visibility"] == "private"
     assert metadata["owner_login"] == "Alice"
+    assert metadata["source"] == "slack"
 
 
 @pytest.mark.parametrize(

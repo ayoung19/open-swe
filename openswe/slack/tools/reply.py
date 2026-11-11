@@ -17,6 +17,7 @@ from openswe import event_claims
 from openswe.dashboard.options import model_supports_images
 from openswe.input_messages import input_message_timestamps
 from openswe.prompts import prompt
+from openswe.rollout_events import ROLLOUT_CHECK_CONTEXT
 from openswe.run_config import RunConfig
 from openswe.slack.blocks import (
     MARKDOWN_TEXT_MAX_CHARS,
@@ -48,12 +49,16 @@ from openswe.slack.review_links import preserve_github_links as github_link_deli
 from openswe.slack.routed_work import RoutedWork
 from openswe.slack.thinking import restore_slack_thinking_status, settle_slack_thread_status
 from openswe.slack.tools.read_thread_messages import fetch_and_format_thread
+from openswe.source_context import SourceContext
+from openswe.threads.store import THREADS
+from openswe.utils.dashboard_handoff import DASHBOARD_HANDOFF_BODY
 from openswe.utils.http import DEFAULT_HTTP_TIMEOUT
 from openswe.utils.http_pool import pooled_transport
 from openswe.utils.json_types import thread_metadata
 from openswe.utils.multimodal import fetch_image_block, vision_not_supported_warning
 from openswe.utils.run_usage import RunUsageSummary, summarize_run_usage
 from openswe.utils.thread_ops import langgraph_client as get_langgraph_client
+from openswe.webhooks.event_matches import EVENT_MATCH_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +138,25 @@ async def send_slack_reply(
     run_id = _current_run_id(config)
     slack_thread = cfg.slack_thread.dump() if cfg.slack_thread else {}
     thread_id = cfg.thread_id
+    thread = await THREADS.get(thread_id) if thread_id else None
+    metadata = thread.metadata if thread is not None else {}
+    rollout_thread = SourceContext.parse(metadata.get(ROLLOUT_CHECK_CONTEXT)).slack_thread
+    rollout_result = (
+        config.get("metadata", {}).get("kind") == EVENT_MATCH_KIND
+        and rollout_thread is not None
+        and rollout_thread.location is not None
+        and cfg.slack_thread is not None
+        and rollout_thread.location == cfg.slack_thread.location
+    )
+    if not rollout_result and (
+        metadata.get("source") == "dashboard" or (state or {}).get("reply_surface") == "web"
+    ):
+        return {
+            "success": False,
+            "error": "Conversation has moved to Web",
+            "retry": False,
+            "hint": DASHBOARD_HANDOFF_BODY,
+        }
     if cfg.slack_ask is True and cfg.slack_by_the_way_thread_ts:
         return await _by_the_way_reply(
             cfg, cfg.slack_by_the_way_thread_ts, message, response_type, blocks, options

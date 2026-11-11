@@ -1900,8 +1900,9 @@ def test_admin_cancel_thread_dependency_rejects_non_admin(monkeypatch) -> None:
     assert exc_info.value.status_code == 403
 
 
+@pytest.mark.parametrize("source", ["dashboard", "slack"])
 async def test_steer_running_thread_records_and_delivers_the_follow_up(
-    monkeypatch, registry_db: None
+    monkeypatch, registry_db: None, source: str
 ) -> None:
     updates: list[dict[str, object]] = []
     turn = uuid7()
@@ -1946,7 +1947,7 @@ async def test_steer_running_thread_records_and_delivers_the_follow_up(
             },
         },
         metadata={
-            "source": "dashboard",
+            "source": source,
             "transcript": "v2",
             # Stale: the proxy has not yet recorded the run that owns the turn.
             "latest_run_id": "run-0",
@@ -1972,7 +1973,8 @@ async def test_steer_running_thread_records_and_delivers_the_follow_up(
     assert queued.content["queue_id"] == "msg-1"
     assert queued.content["text"] == "also check the tests"
     assert queued.content["sender"]["github_login"] == "teammate"
-    assert "source" not in queued.content
+    assert queued.content.get("source") == ("dashboard" if source == "slack" else None)
+    assert any(update.get("source") == "dashboard" for update in updates)
     # The transcript shows it on the live turn right away, under the id the
     # middleware will record it with, so the two writes deduplicate.
     [command] = appended

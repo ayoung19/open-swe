@@ -1,6 +1,7 @@
 import importlib
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any, Literal
 from unittest.mock import AsyncMock
 
@@ -18,9 +19,79 @@ def _patch_slack_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     async def mutation_lock(*_args: Any):
         yield
 
+    monkeypatch.setattr(slack_reply_tool.THREADS, "get", AsyncMock(return_value=None))
     monkeypatch.setattr(slack_reply_tool, "slack_thread_mutation_lock", mutation_lock)
     monkeypatch.setattr(slack_reply_tool, "restore_slack_thinking_status", AsyncMock())
     monkeypatch.setattr(slack_reply_tool, "get_slack_permalink", AsyncMock(return_value=None))
+
+
+@pytest.mark.parametrize("state_only", [False, True])
+async def test_web_handoff_refuses_slack_until_a_later_slack_turn(
+    monkeypatch: pytest.MonkeyPatch, state_only: bool
+) -> None:
+    config = _config()
+    config["configurable"]["thread_id"] = "thread-1"
+    metadata = {"source": "slack" if state_only else "dashboard"}
+    monkeypatch.setattr(slack_reply_tool, "get_config", lambda: config)
+    monkeypatch.setattr(
+        slack_reply_tool.THREADS, "get", AsyncMock(return_value=SimpleNamespace(metadata=metadata))
+    )
+    monkeypatch.setattr(slack_reply_tool, "get_langgraph_client", _Client)
+    monkeypatch.setattr(
+        slack_reply_tool,
+        "get_active_slack_thread",
+        AsyncMock(return_value={"channel_id": "C1", "thread_ts": "1.0"}),
+    )
+    post = AsyncMock(return_value="2.0")
+    monkeypatch.setattr(slack_reply_tool, "_post_and_store_mapping", post)
+    state = {"reply_surface": "web"} if state_only else {}
+
+    result = await slack_reply_tool.slack_reply("The answer", "final", state=state)
+
+    assert result["success"] is False
+    assert result["retry"] is False
+    assert "dashboard stream" in result["hint"]
+    post.assert_not_awaited()
+
+    metadata["source"] = "slack"
+    result = await slack_reply_tool.slack_reply(
+        "The answer", "final", state={"reply_surface": "slack"}
+    )
+    assert result["success"] is True
+    assert result["message_ts"] == "2.0"
+
+
+@pytest.mark.parametrize("requested_thread", ["1.0", "another-thread"])
+async def test_web_handoff_keeps_rollout_results_in_the_requested_slack_thread(
+    monkeypatch: pytest.MonkeyPatch, requested_thread: str
+) -> None:
+    config = _config()
+    config["configurable"]["thread_id"] = "thread-1"
+    config["metadata"] = {"kind": "event_match"}
+    metadata = {
+        "source": "dashboard",
+        "rollout_check_context": {
+            "slack_thread": {"channel_id": "C1", "thread_ts": requested_thread}
+        },
+    }
+    monkeypatch.setattr(slack_reply_tool, "get_config", lambda: config)
+    monkeypatch.setattr(
+        slack_reply_tool.THREADS, "get", AsyncMock(return_value=SimpleNamespace(metadata=metadata))
+    )
+    monkeypatch.setattr(slack_reply_tool, "get_langgraph_client", _Client)
+    monkeypatch.setattr(
+        slack_reply_tool,
+        "get_active_slack_thread",
+        AsyncMock(return_value={"channel_id": "C1", "thread_ts": "1.0"}),
+    )
+    post = AsyncMock(return_value="2.0")
+    monkeypatch.setattr(slack_reply_tool, "_post_and_store_mapping", post)
+
+    result = await slack_reply_tool.slack_reply("Deployed", "final", state={"reply_surface": "web"})
+
+    assert result["success"] is (requested_thread == "1.0")
+    if requested_thread != "1.0":
+        post.assert_not_awaited()
 
 
 class _Threads:

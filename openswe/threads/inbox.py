@@ -23,6 +23,7 @@ import httpx2
 from langgraph_sdk import get_client
 from pydantic import JsonValue
 from runtime_api.catalog import InboxSpec
+from runtime_api.provenance import Provenance
 
 from openswe.dashboard.options import model_supports_images
 from openswe.input_messages import (
@@ -30,10 +31,10 @@ from openswe.input_messages import (
     RunMessage,
     SystemIdentity,
     build_input_messages,
+    run_context,
 )
 from openswe.message_queue import QueuedMessage
 from openswe.middleware.require_user_reply import (
-    SLACK_REPLY_SURFACE,
     WEB_REPLY_SURFACE,
     ReplySurface,
 )
@@ -253,7 +254,6 @@ class ThreadInbox:
         self, taken: Taken, run_id: str, spec: InboxSpec
     ) -> None:
         """Follow-ups queued for the thread, oldest first."""
-        surface: ReplySurface = spec.surface
         queued_updates: list[dict[str, Any]] = []
         moved: ReplySurface | None = None
         content_blocks: list[dict[str, Any]] = []
@@ -292,31 +292,16 @@ class ThreadInbox:
             taken.relay_updated = True
             if _is_dashboard_queued_message(content):
                 _flush_blocks(queued_updates, content_blocks, injected)
-                # Only the move itself is worth announcing. Re-announcing it on
-                # every later web follow-up stacks identical handoff notices in
-                # the dashboard stream, so the run's notice keeps one id: a later
-                # batch's copy replaces it where it is.
-                if surface == SLACK_REPLY_SURFACE:
-                    handoff = build_input_messages(
-                        DASHBOARD_HANDOFF_BODY,
-                        {
-                            "sender_id": "system:dashboard-handoff",
-                            "surface": "automation",
-                            "kind": "system",
-                        },
-                        systems=[
-                            {
-                                "id": "system:dashboard-handoff",
-                                "display_name": "Dashboard handoff",
-                                "platform": "open-swe",
-                            }
-                        ],
-                        injected_dynamic_context_hashes=injected,
-                    )
-                    for index, message in enumerate(handoff):
-                        message["id"] = f"dashboard-handoff:{run_id}:{index}"
-                    queued_updates.extend(cast(list[dict[str, Any]], handoff))
-                surface = moved = WEB_REPLY_SURFACE
+                queued_updates.append(
+                    {
+                        "role": "user",
+                        "content": run_context("source", DASHBOARD_HANDOFF_BODY),
+                        "additional_kwargs": Provenance(
+                            kind="context", sender="run:source"
+                        ).stamp(),
+                    }
+                )
+                moved = WEB_REPLY_SURFACE
             if isinstance(content, dict) and (
                 "text" in content or "image_urls" in content or "images" in content
             ):

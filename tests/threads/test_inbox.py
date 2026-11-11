@@ -3,11 +3,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from runtime_api.catalog import InboxSpec
+from runtime_api.provenance import Provenance
 
-from openswe.input_messages import RunMessage
+from openswe.input_messages import RunMessage, run_context
 from openswe.message_queue import QueuedMessage
 from openswe.middleware.require_user_reply import ReplySurface
 from openswe.threads.inbox import Taken, ThreadInbox
+from openswe.utils.dashboard_handoff import DASHBOARD_HANDOFF_BODY
 from openswe.utils.thread_ops import queue_system_note_for_thread
 
 
@@ -23,26 +25,29 @@ async def _read(surface: ReplySurface = "web") -> Taken:
     return await ThreadInbox("thread-1").read("run-1", InboxSpec(surface=surface))
 
 
-@pytest.mark.asyncio
-async def test_inbox_announces_the_move_to_web_only_once(registry_db: None) -> None:
-    await QueuedMessage.put(
-        "thread-1",
-        {
-            "text": "and another thing",
-            "source": "dashboard",
-            "queue_id": "8a60896d-65ca-4e40-8a2d-1fbe81777002",
-            "sender": {
-                "id": "github:octocat",
-                "platform": "github",
-                "github_login": "octocat",
-            },
-        },
+@pytest.mark.parametrize("surface", ["slack", "web"])
+async def test_inbox_replaces_source_guidance_when_the_conversation_moves_to_web(
+    monkeypatch: pytest.MonkeyPatch, surface: ReplySurface
+) -> None:
+    queued = QueuedMessage(
+        thread_id="thread-1", content={"text": "and another thing", "source": "dashboard"}
     )
+    queued.seq = 1
+    monkeypatch.setattr(QueuedMessage, "for_thread", AsyncMock(return_value=[queued]))
 
-    taken = await _read("web")
+    taken = await _read(surface)
 
-    envelopes = [_envelope(message) for message in taken.messages]
-    assert not any("system:dashboard-handoff" in envelope for envelope in envelopes)
+    assert taken.reply_surface == "web"
+    source = [
+        message
+        for message in taken.messages
+        if (provenance := Provenance.of(message)) is not None and provenance.sender == "run:source"
+    ]
+    assert len(source) == 1
+    assert source[0]["content"] == run_context("source", DASHBOARD_HANDOFF_BODY)
+    assert Provenance.of(source[0]).kind == "context"
+    if surface == "web":
+        assert not any("system:dashboard-handoff" in _envelope(m) for m in taken.messages)
 
 
 @pytest.mark.asyncio

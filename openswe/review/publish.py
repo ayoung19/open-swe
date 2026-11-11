@@ -795,7 +795,8 @@ async def post_pull_request_review(
             # so the tool layer can prune the offending findings and retry
             # once, instead of the agent retrying with byte-identical args.
             error_kind: str | None = None
-            raw_errors: list[Any] = []
+            raw_errors: list[object] = []
+            oversized_paths: list[str] = []
             error_messages: list[object] = []
             if e.response.status_code == 422:
                 try:
@@ -807,12 +808,19 @@ async def post_pull_request_review(
                         error_messages = [parsed.get("message"), *raw_errors]
                 except Exception:  # noqa: BLE001 — body may not be JSON
                     raw_errors = []
-                if any(
-                    isinstance(err, str)
-                    and ("Path could not be resolved" in err or "Line could not be resolved" in err)
-                    for err in raw_errors
-                ):
-                    error_kind = "unresolved_anchor"
+                for error in error_messages:
+                    message = error.get("message") if isinstance(error, dict) else error
+                    if not isinstance(message, str):
+                        continue
+                    oversized_paths.extend(
+                        re.findall(r"Diff entry (.+?) diff is too large", message)
+                    )
+                    if (
+                        "Path could not be resolved" in message
+                        or "Line could not be resolved" in message
+                        or oversized_paths
+                    ):
+                        error_kind = "unresolved_anchor"
                 for error in error_messages:
                     message = error.get("message") if isinstance(error, dict) else error
                     if isinstance(message, str) and "your own pull request" in message:
@@ -822,6 +830,7 @@ async def post_pull_request_review(
                 "_error": f"HTTP {e.response.status_code}: {body}",
                 "_error_kind": error_kind,
                 "_raw_errors": raw_errors,
+                "_oversized_paths": oversized_paths,
                 "_status": e.response.status_code,
             }
         except httpx2.HTTPError as e:

@@ -880,10 +880,7 @@ async def test_publish_review_matches_comment_ids_by_marker_not_path_line_body()
 async def test_publish_review_drops_unresolvable_findings_and_retries_once(
     registry_db: None,
 ) -> None:
-    """When GitHub rejects the batch with an ``unresolved_anchor`` 422, the
-    tool must filter the bad findings against the PR diff_line_set, re-POST
-    with only the valid ones, return ``success=True``, and report the dropped
-    finding ids via ``unresolvable_findings`` plus a corrective hint."""
+    """Retry valid findings once and report the excluded IDs."""
     from openswe.tools.publish_review import _publish_review_async
 
     findings = [
@@ -921,6 +918,15 @@ async def test_publish_review_drops_unresolvable_findings_and_retries_once(
             AsyncMock(return_value=findings),
         ),
         patch("openswe.tools.publish_review.post_pull_request_review", post_review),
+        patch(
+            "openswe.tools.publish_review.fetch_pr_diff",
+            AsyncMock(
+                return_value=(
+                    "diff --git a/in_diff.py b/in_diff.py\n"
+                    "--- a/in_diff.py\n+++ b/in_diff.py\n@@ -1 +10 @@\n+touched\n"
+                )
+            ),
+        ),
         patch("openswe.tools.publish_review.fetch_review_comments", fetch_comments),
         patch(
             "openswe.tools.publish_review._resolve_threads_for_resolved_findings",
@@ -965,9 +971,7 @@ async def test_publish_review_drops_unresolvable_findings_and_retries_once(
 
 @pytest.mark.asyncio
 async def test_publish_review_reports_unresolvable_when_retry_still_fails() -> None:
-    """If even the filtered retry fails, the tool surfaces
-    ``success=False`` plus the offending finding ids and a hint — it must
-    NOT collapse into the opaque retry-with-same-args loop."""
+    """Report excluded finding IDs even when the filtered retry fails."""
     from openswe.tools.publish_review import _publish_review_async
 
     findings = [
@@ -1002,6 +1006,15 @@ async def test_publish_review_reports_unresolvable_when_retry_still_fails() -> N
         ),
         patch("openswe.tools.publish_review.post_pull_request_review", post_review),
         patch(
+            "openswe.tools.publish_review.fetch_pr_diff",
+            AsyncMock(
+                return_value=(
+                    "diff --git a/in_diff.py b/in_diff.py\n"
+                    "--- a/in_diff.py\n+++ b/in_diff.py\n@@ -1 +10 @@\n+touched\n"
+                )
+            ),
+        ),
+        patch(
             "openswe.tools.publish_review._resolve_threads_for_resolved_findings",
             new_callable=AsyncMock,
             return_value=0,
@@ -1024,10 +1037,11 @@ async def test_publish_review_reports_unresolvable_when_retry_still_fails() -> N
 
 
 @pytest.mark.asyncio
-async def test_publish_review_does_not_retry_when_no_findings_can_be_dropped() -> None:
-    """When the unresolved_anchor 422 fires but the diff_line_set rules out
-    no findings (e.g., diff data unavailable), the tool must NOT retry — it
-    must surface the structured error so the agent stops looping."""
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_publish_review_does_not_retry_without_valid_subset(
+    oversized: bool,
+) -> None:
+    """Do not retry when all or none of the rejected anchors are identified."""
     from openswe.tools.publish_review import _publish_review_async
 
     findings = [
@@ -1040,6 +1054,7 @@ async def test_publish_review_does_not_retry_when_no_findings_can_be_dropped() -
         "_error_kind": "unresolved_anchor",
         "_raw_errors": ["Path could not be resolved"],
         "_status": 422,
+        "_oversized_paths": ["in_diff.py"] if oversized else [],
     }
     post_review = AsyncMock(return_value=first_response)
 
@@ -1055,7 +1070,7 @@ async def test_publish_review_does_not_retry_when_no_findings_can_be_dropped() -
         ),
         patch("openswe.tools.publish_review.post_pull_request_review", post_review),
         patch(
-            "openswe.tools.publish_review._resolve_diff_line_set",
+            "openswe.tools.publish_review.fetch_pr_diff",
             new_callable=AsyncMock,
             return_value=None,
         ),
@@ -1079,8 +1094,11 @@ async def test_publish_review_does_not_retry_when_no_findings_can_be_dropped() -
     # Only one attempt — never retry blindly.
     assert post_review.await_count == 1
     assert result["success"] is False
-    assert result["unresolvable_findings"] == []
-    assert "update_finding" in result["hint"]
+    assert result["unresolvable_findings"] == (["f_only"] if oversized else [])
+    assert "current PR diff" in result["hint"]
+    if not oversized:
+        assert "unresolved_anchor" in result["hint"]
+        assert "these ids" not in result["hint"]
 
 
 async def test_publish_review_tool_returns_structured_error_when_thread_missing() -> None:
@@ -1367,13 +1385,11 @@ async def test_approval_publication_handles_github_rejections(
         settle_check.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_publish_review_fetches_pr_diff_when_diff_line_set_missing() -> None:
-    """Reviewer runs clear ``diff_line_set`` from config before the agent
-    starts, so the publish-time retry path must fall back to fetching the
-    PR's unified diff on demand and recomputing the line set — otherwise no
-    finding is ever droppable and the retry surfaces empty
-    ``unresolvable_findings`` for the reachable production case."""
+@pytest.mark.parametrize("oversized,fetch_fails", [(False, False), (True, False), (True, True)])
+async def test_publish_review_recovers_with_current_diff(
+    oversized: bool, fetch_fails: bool
+) -> None:
+    """Anchor recovery ignores stale caches and preserves unpublished findings."""
     from openswe.tools.publish_review import _publish_review_async
 
     findings = [
@@ -1385,6 +1401,7 @@ async def test_publish_review_fetches_pr_diff_when_diff_line_set_missing() -> No
         "_error_kind": "unresolved_anchor",
         "_raw_errors": ["Path could not be resolved"],
         "_status": 422,
+        "_oversized_paths": ["not_in_diff.py"] if oversized else [],
     }
     retry_response = {"id": 9999}
     post_review = AsyncMock(side_effect=[first_response, retry_response])
@@ -1397,10 +1414,21 @@ async def test_publish_review_fetches_pr_diff_when_diff_line_set_missing() -> No
         "+touched\n"
     )
 
+    if oversized:
+        pr_diff += (
+            "diff --git a/not_in_diff.py b/not_in_diff.py\n"
+            "--- a/not_in_diff.py\n+++ b/not_in_diff.py\n@@ -1 +99 @@\n+large\n"
+        )
+
     with (
         patch(
             "openswe.run_config.get_config",
-            return_value={"configurable": {"thread_id": "tid"}},
+            return_value={
+                "configurable": {
+                    "thread_id": "tid",
+                    "diff_line_set": {"not_in_diff.py": {"RIGHT": {99}}},
+                }
+            },
         ),
         patch("openswe.tools.publish_review.get_thread_id_from_runtime", return_value="tid"),
         patch(
@@ -1410,7 +1438,7 @@ async def test_publish_review_fetches_pr_diff_when_diff_line_set_missing() -> No
         patch("openswe.tools.publish_review.post_pull_request_review", post_review),
         patch(
             "openswe.tools.publish_review.fetch_pr_diff",
-            AsyncMock(return_value=pr_diff),
+            AsyncMock(return_value=None if fetch_fails else pr_diff),
         ),
         patch("openswe.tools.publish_review.fetch_review_comments", AsyncMock(return_value=[])),
         patch(
@@ -1436,6 +1464,7 @@ async def test_publish_review_fetches_pr_diff_when_diff_line_set_missing() -> No
             token="t",
             severity_threshold="medium",
             is_re_review=False,
+            state={"diff_line_set": {"not_in_diff.py": {"RIGHT": {99}}}},
         )
 
     assert post_review.await_count == 2
@@ -1443,3 +1472,71 @@ async def test_publish_review_fetches_pr_diff_when_diff_line_set_missing() -> No
     assert {c["path"] for c in retry_inline} == {"in_diff.py"}
     assert result["success"] is True
     assert result["unresolvable_findings"] == ["f_bad"]
+    assert findings[1]["status"] == "open"
+    assert not findings[1].get("github_review_id")
+    assert "not_in_diff.py" not in post_review.await_args.kwargs["body"]
+
+
+@pytest.mark.parametrize(
+    "errors,paths",
+    [
+        (["Path could not be resolved"], []),
+        (["Line could not be resolved"], []),
+        (
+            ["Diff entry src/a file.py diff is too large", "Diff entry b.py diff is too large"],
+            ["src/a file.py", "b.py"],
+        ),
+        ([{"message": "Diff entry src/a.py diff is too large"}], ["src/a.py"]),
+    ],
+)
+async def test_post_review_classifies_anchor_rejections(
+    errors: list[object], paths: list[str]
+) -> None:
+    import httpx2
+
+    request = httpx2.Request("POST", "https://api.github.com/repos/o/r/pulls/7/reviews")
+    response = httpx2.Response(422, json={"errors": errors}, request=request)
+    with patch("openswe.review.publish.github_request", AsyncMock(return_value=response)):
+        result = await post_pull_request_review(
+            owner="o",
+            repo="r",
+            pr_number=7,
+            head_sha="sha",
+            body="Review",
+            inline_comments=[],
+            token="t",
+        )
+    assert result is not None
+    assert result["_error_kind"] == "unresolved_anchor"
+    assert result["_oversized_paths"] == paths
+
+
+@pytest.mark.parametrize(
+    "side,start,end,valid",
+    [
+        ("RIGHT", 10, 11, True),
+        ("LEFT", 1, 2, True),
+        ("RIGHT", 1, 2, False),
+        ("LEFT", 10, 11, False),
+        ("RIGHT", 10, 12, False),
+    ],
+)
+async def test_anchor_recovery_matches_range_and_side(
+    side: Literal["LEFT", "RIGHT"], start: int, end: int, valid: bool
+) -> None:
+    from openswe.tools.publish_review import _filter_against_pr_diff
+
+    finding = _f(id="f", file="a.py", side=side, start_line=start, end_line=end)
+    payload = {"path": "a.py", "line": end, "side": side}
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,2 +10,2 @@\n-old\n-old\n+new\n+new\n"
+    with patch("openswe.tools.publish_review.fetch_pr_diff", AsyncMock(return_value=diff)):
+        kept, dropped = await _filter_against_pr_diff(
+            [(finding, payload)],
+            owner="o",
+            repo="r",
+            pr_number=7,
+            token="t",
+            oversized_paths=set(),
+        )
+    assert bool(kept) is valid
+    assert dropped == ([] if valid else ["f"])

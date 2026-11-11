@@ -543,13 +543,16 @@ async def _publish_review_async(
         isinstance(review_response, dict)
         and review_response.get("_error_kind") == "unresolved_anchor"
     ):
+        oversized_paths = review_response.get("_oversized_paths", [])
         valid_with_payload, dropped_ids = await _filter_against_pr_diff(
             eligible_with_payload,
             owner=owner,
             repo=repo,
             pr_number=pr_number,
             token=token,
-            state=state,
+            oversized_paths={path for path in oversized_paths if isinstance(path, str)}
+            if isinstance(oversized_paths, list)
+            else set(),
         )
         if dropped_ids and valid_with_payload:
             retry_inline = [p for _, p in valid_with_payload]
@@ -588,22 +591,22 @@ async def _publish_review_async(
                     "error": f"Failed to POST PR review: {retry_error}",
                     "unresolvable_findings": dropped_ids,
                     "hint": (
-                        "Call update_finding(status='resolved') on these ids "
-                        "or fix their file/line before retrying."
+                        "Use update_finding to correct the file, line range, or side of these ids "
+                        "after checking the current PR diff."
                     ),
                 }
         else:
-            # Either nothing to drop (no diff_line_set available, so we can't
-            # tell which findings are bad) or everything would be dropped.
-            # Either way, do not retry — surface the structural signal so the
-            # agent stops retrying with the same args.
             return {
                 "success": False,
                 "error": f"Failed to POST PR review: {review_response['_error']}",
                 "unresolvable_findings": dropped_ids,
                 "hint": (
-                    "Call update_finding(status='resolved') on these ids "
-                    "or fix their file/line before retrying."
+                    "Use update_finding to correct the file, line range, or side of these ids "
+                    "after checking the current PR diff."
+                    if dropped_ids
+                    else "GitHub rejected an unresolved_anchor (path, line, or oversized diff), "
+                    "but no specific findings could be identified. Check the current PR diff "
+                    "and stacked or moved-base paths before updating anchors and retrying."
                 ),
             }
     if isinstance(review_response, dict) and "_error" in review_response:
@@ -1055,37 +1058,6 @@ async def _record_review_publication(
         await replace_findings(thread_id, latest)
 
 
-async def _resolve_diff_line_set(
-    *,
-    owner: str,
-    repo: str,
-    pr_number: int,
-    token: str,
-    state: dict[str, Any] | None = None,
-) -> dict[str, dict[str, set[int]]] | None:
-    """Return the new-side line set for the PR diff, fetching it if needed.
-
-    Reviewer runs clear ``configurable['diff_line_set']`` before the agent
-    starts (so ``add_finding`` trusts the agent's anchors), which means the
-    publish-time retry path can't rely on it being populated. Fetch the PR's
-    unified diff from the GitHub REST API and recompute the line set on the
-    fly. Returns ``None`` if the fetch fails — caller treats that as "we
-    can't tell which finding is bad, don't retry blindly".
-    """
-    if isinstance(state, dict):
-        state_cached = state.get("diff_line_set")
-        if isinstance(state_cached, dict):
-            return state_cached
-    cached = RunConfig.from_runtime().diff_line_set
-    if cached is not None:
-        return cached
-
-    diff_text = await fetch_pr_diff(owner=owner, repo=repo, pr_number=pr_number, token=token)
-    if diff_text is None:
-        return None
-    return compute_diff_line_set(diff_text)
-
-
 async def _filter_against_pr_diff(
     eligible_with_payload: list[tuple[Finding, dict[str, Any]]],
     *,
@@ -1093,20 +1065,11 @@ async def _filter_against_pr_diff(
     repo: str,
     pr_number: int,
     token: str,
-    state: dict[str, Any] | None = None,
+    oversized_paths: set[str],
 ) -> tuple[list[tuple[Finding, dict[str, Any]]], list[str]]:
-    """Drop findings whose path/line range is not in the current PR diff.
-
-    Returns ``(valid_with_payload, dropped_finding_ids)``. When the diff
-    cannot be resolved (fetch failed and no cached set), we return everything
-    unchanged and an empty drop list — the caller will then surface the
-    original error rather than retry blindly.
-    """
-    diff_line_set = await _resolve_diff_line_set(
-        owner=owner, repo=repo, pr_number=pr_number, token=token, state=state
-    )
-    if diff_line_set is None:
-        return list(eligible_with_payload), []
+    """Identify rejected anchors using a fresh PR diff and GitHub's oversized paths."""
+    diff_text = await fetch_pr_diff(owner=owner, repo=repo, pr_number=pr_number, token=token)
+    diff_line_set = compute_diff_line_set(diff_text) if diff_text is not None else None
 
     valid: list[tuple[Finding, dict[str, Any]]] = []
     dropped: list[str] = []
@@ -1122,8 +1085,13 @@ async def _filter_against_pr_diff(
                 if start_line is None:
                     start_line = payload_line
         side = finding.get("side") if finding.get("side") in {"LEFT", "RIGHT"} else "RIGHT"
-        if isinstance(path, str) and is_range_in_diff(
-            diff_line_set, path, start_line, end_line, side=side
+        if (
+            isinstance(path, str)
+            and path not in oversized_paths
+            and (
+                diff_line_set is None
+                or is_range_in_diff(diff_line_set, path, start_line, end_line, side=side)
+            )
         ):
             valid.append((finding, payload))
         else:

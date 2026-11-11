@@ -618,7 +618,12 @@ async def resolve_all_dashboard_threads(login: str, *, email: str | None = None)
 
 
 async def resolve_dashboard_thread(
-    thread_id: str, login: str, *, resolved: bool, email: str | None = None
+    thread_id: str,
+    login: str,
+    *,
+    resolved: bool,
+    email: str | None = None,
+    principal: Principal | None = None,
 ) -> dict[str, Any]:
     """Archive a thread with its readable task workers, or restore only the thread."""
     await _authorized_thread(thread_id, login, email=email)
@@ -626,6 +631,8 @@ async def resolve_dashboard_thread(
         async with agent_thread_pr_state_lock(thread_id):
             thread = await _authorized_thread(thread_id, login, email=email)
             metadata = thread_metadata(thread)
+            if principal is not None:
+                principal.assert_can_post(metadata)
             metadata_update: JsonObject = {
                 "resolved": resolved,
                 "resolved_at_ms": _now_ms() if resolved else None,
@@ -654,7 +661,9 @@ async def resolve_dashboard_thread(
         for worker_id in workers:
             try:
                 async with agent_thread_pr_state_lock(worker_id):
-                    await _authorized_thread(worker_id, login, email=email)
+                    worker = await _authorized_thread(worker_id, login, email=email)
+                    if principal is not None:
+                        principal.assert_can_post(thread_metadata(worker))
                     await THREADS.update(worker_id, metadata_update)
             except Exception:
                 logger.exception(

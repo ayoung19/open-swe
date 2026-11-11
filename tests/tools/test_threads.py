@@ -397,6 +397,9 @@ async def test_automation_run_reads_public_threads_but_cannot_write(
     )
 
     listed = await threads_tool.list_threads(scope="automation", automation_id=_AUTOMATION_ID)
+    monkeypatch.setattr(
+        threads_tool, "get_dashboard_thread", AsyncMock(side_effect=HTTPException(404, "not found"))
+    )
     sent = await threads_tool.manage_thread(
         action="send_message", thread_id="dm-thread", message="digest"
     )
@@ -409,7 +412,7 @@ async def test_automation_run_reads_public_threads_but_cannot_write(
     assert awaited.kwargs["include_private"] is False
     for refused in (sent, started):
         assert refused["success"] is False
-        assert "cannot message" in refused["error"]
+        assert refused["error"] == threads_tool._NO_WRITER
 
 
 def _creator_dm(
@@ -1225,3 +1228,144 @@ async def test_public_worker_can_only_reply_to_its_owners_relaying_private_threa
             "status_code": 403,
         }
         proxy.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("automation_id", "owner", "action"),
+    [
+        ("other", None, "send_message"),
+        (_AUTOMATION_ID, "octocat", "send_message"),
+        (_AUTOMATION_ID, None, "cancel"),
+        (_AUTOMATION_ID, None, "update_plan"),
+    ],
+)
+async def test_schedule_cannot_manage_other_or_owned_threads(
+    monkeypatch: pytest.MonkeyPatch, automation_id: str, owner: str | None, action: str
+) -> None:
+    _automation_run(
+        monkeypatch, {"owner_type": "system", "visibility": "public", "schedule_id": _AUTOMATION_ID}
+    )
+    monkeypatch.setattr(
+        threads_tool,
+        "get_dashboard_thread",
+        AsyncMock(
+            return_value={"id": "target", "automationId": automation_id, "ownerLogin": owner}
+        ),
+    )
+    result = await threads_tool.manage_thread(
+        "target", action, message="Continue" if action == "send_message" else None
+    )
+    assert result == {"success": False, "error": threads_tool._NO_WRITER}
+
+
+async def test_schedule_continues_through_dispatch_with_system_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime_api.provenance import Provenance
+
+    from openswe.threads import proxy, runs
+    from openswe.threads.store import CommandReply
+
+    metadata = {
+        "owner_type": "system",
+        "visibility": "public",
+        "schedule_id": _AUTOMATION_ID,
+        "workspace": "core",
+        "environment": "core",
+    }
+    _automation_run(monkeypatch, metadata)
+    monkeypatch.setattr(
+        proxy.THREADS,
+        "get",
+        AsyncMock(return_value=SimpleNamespace(metadata=metadata, status="idle")),
+    )
+    monkeypatch.setattr(
+        threads_tool,
+        "get_dashboard_thread",
+        AsyncMock(
+            return_value={
+                "id": "automation-thread",
+                "automationId": _AUTOMATION_ID,
+                "ownerLogin": None,
+            }
+        ),
+    )
+    command = AsyncMock(
+        return_value=CommandReply(
+            200, b'{"type":"success","result":{"run_id":"run-1"}}', "application/json"
+        )
+    )
+    monkeypatch.setattr(proxy.THREADS, "command", command)
+    monkeypatch.setattr(proxy.THREADS, "update", AsyncMock())
+    monkeypatch.setattr(proxy, "_observe_dashboard_run_ttft", AsyncMock())
+    monkeypatch.setattr(runs, "_resolve_sandbox_bridge", AsyncMock(return_value=None))
+
+    result = await threads_tool.manage_thread(
+        "automation-thread", "send_message", message="Continue CI upkeep"
+    )
+
+    assert result["success"] is True
+    assert result["run_id"] == "run-1"
+    assert command.await_args is not None
+    dispatched = json.loads(command.await_args.args[1])["params"]
+    provenance = Provenance.of(dispatched["input"]["messages"][-1])
+    assert provenance is not None
+    assert provenance.kind == "system"
+    assert provenance.sender == f"system:schedule:{_AUTOMATION_ID}"
+    configurable = dispatched["config"]["configurable"]
+    assert "github_login" not in configurable
+    assert configurable["schedule_id"] == _AUTOMATION_ID
+    assert configurable["workspace"] == "core"
+
+
+@pytest.mark.parametrize("resolved", [True, False])
+async def test_schedule_resolution_only_changes_matching_unowned_workers(
+    monkeypatch: pytest.MonkeyPatch, resolved: bool
+) -> None:
+    from contextlib import nullcontext
+
+    from openswe.analytics import emitter
+    from openswe.threads import handlers
+
+    metadata: dict[str, dict[str, object]] = {
+        "parent": {"schedule_id": _AUTOMATION_ID},
+        "mine": {"schedule_id": _AUTOMATION_ID},
+        "owned": {"schedule_id": _AUTOMATION_ID, "owner_login": "octocat"},
+        "other": {"schedule_id": "other"},
+    }
+    _automation_run(
+        monkeypatch, {"owner_type": "system", "visibility": "public", "schedule_id": _AUTOMATION_ID}
+    )
+    monkeypatch.setattr(
+        threads_tool,
+        "get_dashboard_thread",
+        AsyncMock(
+            return_value={"id": "parent", "automationId": _AUTOMATION_ID, "ownerLogin": None}
+        ),
+    )
+
+    async def get(thread_id: str, login: str, *, email: str | None = None) -> dict[str, object]:
+        return {"thread_id": thread_id, "metadata": metadata[thread_id]}
+
+    async def update(thread_id: str, changes: dict[str, object]) -> None:
+        metadata[thread_id].update(changes)
+
+    monkeypatch.setattr(handlers, "_authorized_thread", get)
+    monkeypatch.setattr(handlers, "agent_thread_pr_state_lock", lambda _: nullcontext())
+    monkeypatch.setattr(handlers.THREADS, "update", update)
+    monkeypatch.setattr(
+        handlers,
+        "sidebar_memberships",
+        AsyncMock(return_value={"mine": {}, "owned": {}, "other": {}}),
+    )
+    monkeypatch.setattr(handlers, "_thread_summary", AsyncMock(return_value={"id": "parent"}))
+    monkeypatch.setattr(emitter, "task_marked_complete", AsyncMock())
+    monkeypatch.setattr(emitter, "task_accepted", AsyncMock())
+
+    result = await threads_tool.manage_thread("parent", "resolve" if resolved else "unresolve")
+
+    assert result["success"] is True
+    assert metadata["parent"]["resolved"] is resolved
+    assert metadata["mine"].get("resolved") == (True if resolved else None)
+    assert "resolved" not in metadata["owned"]
+    assert "resolved" not in metadata["other"]

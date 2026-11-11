@@ -173,12 +173,7 @@ async def proxy_dashboard_thread_commands(
     principal: Principal | None = None,
     relayed_from: str | None = None,
 ) -> tuple[int, bytes, str | None]:
-    """Forward one command, enriched for whoever sent it.
-
-    ``principal`` is how a machine gets in. Without one the sender is the person
-    named by ``login``, which is what the dashboard and the agent's own tools pass.
-    ``relayed_from`` names the agent thread that sent it on that person's behalf.
-    """
+    """Forward one command, enriched for its authenticated person or machine."""
     received_at_ms = _now_ms()
     principal = principal or Principal.of_login(login, email)
     require_json_content_type(content_type)
@@ -202,6 +197,8 @@ async def proxy_dashboard_thread_commands(
 
     creating = False
     if thread is None:
+        if principal.kind == "schedule":
+            raise HTTPException(404, "thread not found")
         if method != "run.start":
             raise HTTPException(404, "thread not found")
         creating = True

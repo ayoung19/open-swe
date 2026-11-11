@@ -1797,13 +1797,9 @@ async def _enrich_system_run_start_command(
     metadata: dict[str, Any],
     creating: bool = False,
 ) -> dict[str, Any]:
-    """The machine-principal half of ``run.start``.
-
-    The person's path resolves a profile, a model, participants and a GitHub
-    token for whoever sent the message. None of that exists here, so this stamps
-    the workspace's own thread and run config and leaves the rest of the command
-    pipeline — forwarding, streaming, run bookkeeping — shared.
-    """
+    """Enrich a machine's run without attributing it to a person."""
+    if principal.kind == "schedule" and creating:
+        raise HTTPException(403, "scheduled runs cannot create threads")
     if command.get("method") != "run.start":
         raise HTTPException(403, "a machine principal may only start runs")
 
@@ -1879,6 +1875,13 @@ async def _enrich_system_run_start_command(
         },
         invocation_id,
     )
+    if principal.kind == "schedule":
+        configurable.update(
+            source="schedule",
+            schedule_id=principal.started_by_id.removeprefix("schedule:"),
+            workspace=metadata.get("workspace"),
+            environment=metadata.get("environment") or metadata.get("workspace"),
+        )
     configurable["invocation_started_at"] = datetime.now(UTC).isoformat()
     stored_repo = repo_config_from_metadata(metadata)
     if stored_repo:

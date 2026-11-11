@@ -47,6 +47,7 @@ from openswe.threads.listing import (
 )
 from openswe.threads.pins import THREAD_PINS
 from openswe.threads.plan_store import get_plan_content, list_plan_comments
+from openswe.threads.principals import Principal
 from openswe.threads.proxy import proxy_dashboard_thread_commands
 from openswe.threads.runs import start_dashboard_thread
 from openswe.threads.store import THREADS
@@ -105,7 +106,8 @@ _NO_ACTOR = "No verified triggering user is available"
 _NO_READER = f"Thread lookup was unavailable. {_NO_ACTOR}"
 _NO_WRITER = (
     f"{_NO_ACTOR}. Automation runs can read threads with list_threads and get_thread "
-    "but cannot message, manage, or start them; to send a result to the automation's "
+    "and can message, resolve, or unresolve their own unowned threads, but cannot "
+    "start threads or manage other threads; to send a result to the automation's "
     "creator, DM them with slack_post_message."
 )
 
@@ -115,8 +117,19 @@ class _Actor:
     login: str
     email: str | None
     name: str
-    # An automation reading threads on its own run; it has no participant threads.
+    # An automation has no participant threads.
     automation: bool = False
+
+    @property
+    def schedule(self) -> Principal | None:
+        if not self.automation or not self.login.startswith("system:schedule:"):
+            return None
+        schedule_id = self.login.removeprefix("system:schedule:")
+        if not schedule_id:
+            return None
+        return Principal(
+            kind="schedule", started_by_id=f"schedule:{schedule_id}", started_by_name=self.name
+        )
 
     @property
     def session(self) -> dict[str, Any]:
@@ -1080,6 +1093,8 @@ async def _send_message(
     configurable: dict[str, Any] = {}
     if model_id and effort:
         configurable.update(agent_model_id=model_id, agent_effort=effort)
+    if actor.schedule:
+        configurable["thread_type"] = "system"
     command = {
         "id": 1,
         "method": "run.start",
@@ -1094,6 +1109,7 @@ async def _send_message(
         actor.login,
         json.dumps(command).encode(),
         email=actor.email,
+        principal=actor.schedule,
         relayed_from=caller_thread_id if isinstance(caller_thread_id, str) else None,
     )
     try:
@@ -1248,6 +1264,15 @@ async def manage_thread(
 ) -> dict[str, Any]:
     """Implement the `manage_thread` tool."""
     actor = await _actor(state)
+    scheduled = actor is None
+    if scheduled:
+        actor = await _reader(state)
+        if (
+            actor is None
+            or actor.schedule is None
+            or action not in {"send_message", "resolve", "unresolve"}
+        ):
+            return _failure(_NO_WRITER)
     if actor is None:
         return _failure(_NO_WRITER)
     thread_id = thread_id.strip()
@@ -1295,6 +1320,11 @@ async def manage_thread(
         if isinstance(resolved, dict):
             return resolved
         thread_id, summary = resolved
+        if scheduled and (
+            summary.get("automationId") != actor.login.removeprefix("system:schedule:")
+            or summary.get("ownerLogin") is not None
+        ):
+            return _failure(_NO_WRITER)
         if action == "send_message":
             return await _send_message(
                 thread_id,
@@ -1326,6 +1356,7 @@ async def manage_thread(
                 thread_id,
                 actor.login,
                 resolved=action == "resolve",
+                principal=actor.schedule if scheduled else None,
                 email=actor.email,
             )
             return {"success": True, "thread": _list_item(thread)}
@@ -1386,6 +1417,8 @@ async def manage_thread(
             return {"success": True, **result}
         return _failure(f"unsupported action: {action}")
     except HTTPException as exc:
+        if scheduled and exc.status_code in {403, 404}:
+            return _failure(_NO_WRITER)
         return _http_failure(exc)
     except Exception:
         logger.exception("Thread action %s failed for %s", action, thread_id)

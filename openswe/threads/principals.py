@@ -1,10 +1,11 @@
 """Whoever is asking to start or read a thread, and what they are allowed to ask for.
 
-Three kinds of principal reach the thread API. A person signs in and gets their
+People and machines reach the thread API. A person signs in and gets their
 own threads. A workspace API key and a federated GitHub Actions workflow are
 machines: they start threads that belong to a workspace rather than to anyone,
 and they may read back only what they themselves started, because none of the
-dashboard's ownership rules describe them.
+dashboard's ownership rules describe them. Authenticated schedules can continue
+only their own existing threads while those threads have no human owner.
 
 Which kind of thread a request creates is never inferred from who asked. The
 request names it, and the principal is checked against it:
@@ -41,7 +42,7 @@ from openswe.workspaces.store import WORKSPACES
 
 logger = logging.getLogger(__name__)
 
-PrincipalKind = Literal["api_key", "github_actions", "person"]
+PrincipalKind = Literal["api_key", "github_actions", "person", "schedule"]
 ThreadType = Literal["system", "workspace", "private"]
 
 STARTED_BY_ID = "started_by_id"
@@ -123,6 +124,8 @@ class Principal:
     @property
     def sender_id(self) -> str:
         """The identity a run records as having sent its opening message."""
+        if self.kind == "schedule":
+            return f"system:{self.started_by_id}"
         if self.machine:
             return f"system:{self.started_by_id.replace(':', '/')}"
         return ThreadIdentity(self.person).sender_id
@@ -147,6 +150,13 @@ class Principal:
         _assert_thread_postable(metadata, self.person, self.email)
 
     def _assert_started_it(self, metadata: JsonObject) -> None:
+        if self.kind == "schedule":
+            if (
+                metadata.get("schedule_id") != self.started_by_id.removeprefix("schedule:")
+                or metadata.get("owner_login") is not None
+            ):
+                raise HTTPException(404, "thread not found")
+            return
         # Deliberately not "is this thread in my workspace": a key is not an
         # owner of everything its workspace runs, and 404 rather than 403 keeps
         # it from discovering which thread ids exist.

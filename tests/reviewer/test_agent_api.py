@@ -2078,3 +2078,40 @@ async def test_langsmith_cloud_run_delegates_to_credential_isolated_sandbox(
     assert result == "managed-cloud"
     assert create.call_args.args[0] == "cloud-thread"
     assert create.call_args.kwargs["allow_github"] is False
+
+
+async def test_search_tools_inlines_monitor_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    from copy import deepcopy
+    from unittest.mock import AsyncMock
+
+    from langchain_core.tools import StructuredTool
+    from runtime_api.catalog import ToolSpec
+    from runtime_api.tool_search import ToolMatches
+
+    from openswe.agent_api.tool_sets import ToolSet
+    from openswe.tools.monitor import monitor
+
+    tool = StructuredTool.from_function(coroutine=monitor, description="Monitor a command.")
+    spec = ToolSpec(
+        name=tool.name,
+        description=tool.description,
+        parameters=tool.args_schema.model_json_schema(),
+    )
+    original = deepcopy(spec.parameters)
+    assert "$defs" in original
+    monkeypatch.setattr(TokenRun, "_tool_set", AsyncMock(return_value=ToolSet([spec])))
+
+    found = ToolMatches.model_validate(
+        await TokenRun.answer(RunKind(), RUN, "search_tools", {"query": "monitor"})
+    )
+
+    [match] = found.matches
+    assert match.name == "monitor"
+    assert '"$ref"' not in match.model_dump_json()
+    assert '"$defs"' not in match.model_dump_json()
+    properties = match.parameters["properties"]
+    assert isinstance(properties, dict)
+    action = properties["action"]
+    assert isinstance(action, dict)
+    assert action["enum"] == ["start", "output", "stop", "list"]
+    assert spec.parameters == original

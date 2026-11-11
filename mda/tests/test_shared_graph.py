@@ -63,7 +63,7 @@ from managed_deepagents.sandbox import SandboxDefinition, SandboxReplacement
 from pydantic import BaseModel, JsonValue
 from rt import backend as rt_backend
 from rt import search_tools
-from rt.backend import Run, current_run
+from rt.backend import OpenSweBackend, Run, current_run
 from rt.managed_sandbox import PROXY_WRITE_BACKOFF_SECONDS, definition, opened_sandbox
 from rt.outbox import Outbox
 from rt.run_tools import ModelHandler, RunCodeInterpreter
@@ -1891,3 +1891,69 @@ async def test_a_tool_result_the_interpreter_cannot_take_fails_the_eval_not_the_
         assert (await repl.eval_async("kept")).result == "1"
     finally:
         await registry.aevict("nest")
+
+
+async def test_search_tools_inlines_nested_schema_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from copy import deepcopy
+
+    from runtime_api.tool_search import ToolIndex
+
+    spec = ToolSpec(
+        name="monitor",
+        description="Monitor a command.",
+        parameters={
+            "type": "object",
+            "$defs": {
+                "Action": {"type": "string", "enum": ["start", "output", "stop", "list"]},
+                "Options": {
+                    "type": "object",
+                    "properties": {"action": {"$ref": "#/$defs/Action"}},
+                },
+            },
+            "properties": {
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            {"$ref": "#/$defs/Options", "description": "Custom options"},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+            },
+            "required": ["options"],
+        },
+    )
+    original = deepcopy(spec.parameters)
+    monkeypatch.setenv("OPEN_SWE_BACKEND_URL", "https://backend.invalid")
+    monkeypatch.setattr(search_tools, "run_tool_index", AsyncMock(return_value=ToolIndex([spec])))
+
+    found = await search_tools.search_tools_tool(OpenSweBackend()).ainvoke({"query": "monitor"})
+
+    assert found[0]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "options": {
+                "type": "array",
+                "items": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["start", "output", "stop", "list"],
+                                }
+                            },
+                            "description": "Custom options",
+                        },
+                        {"type": "null"},
+                    ]
+                },
+            }
+        },
+        "required": ["options"],
+    }
+    assert spec.parameters == original

@@ -30,6 +30,11 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 from langchain_fireworks import ChatFireworks
+from langchain_google_genai.chat_models import (
+    GoogleAPIError,
+    GoogleInvalidRequestError,
+    GoogleRateLimitError,
+)
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 from rt.backend import Run, RunContext
@@ -40,11 +45,13 @@ from rt.model_calls import (
     ModelCallTimeoutMiddleware,
     ReplayableHistoryMiddleware,
     call_with_fallback,
+    is_transient,
     model_call_guards,
 )
 from rt.model_retries import ModelRetriesMiddleware
 from rt.models import ModelSpec, build_model
 from rt.run_prompt import RunPromptMiddleware, ThreadPromptMiddleware
+from rt.task_retry import task_retry_on
 from runtime_api.catalog import Catalog
 from runtime_api.model_errors import is_model_failure_reply
 
@@ -802,3 +809,16 @@ async def test_cancelling_retry_backoff_does_not_start_another_model_attempt(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert handler.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "error,retryable",
+    [
+        (GoogleInvalidRequestError("400 INVALID_ARGUMENT: function_response reference"), False),
+        (GoogleRateLimitError("429 RESOURCE_EXHAUSTED"), True),
+        (GoogleAPIError(503, {"error": {"message": "UNAVAILABLE", "status": "UNAVAILABLE"}}), True),
+    ],
+)
+def test_gemini_retry_classification(error: Exception, retryable: bool) -> None:
+    assert is_transient(error) is retryable
+    assert task_retry_on(error) is retryable

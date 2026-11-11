@@ -18,6 +18,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from typing import Final
 
+from langchain_core.utils.json_schema import dereference_refs
 from pydantic import BaseModel, JsonValue
 
 from runtime_api.catalog import SEARCH_TOOLS, ToolSpec
@@ -114,10 +115,12 @@ class ToolIndex:
     @staticmethod
     def match(tool: ToolSpec) -> ToolMatch:
         """``tool`` as a search shows it to the model."""
+        parameters = dereference_refs(tool.parameters, skip_keys=[])
+        parameters.pop("$defs", None)
         return ToolMatch(
             name=tool.name,
             description=tool.description,
-            parameters=tool.parameters,
+            parameters=parameters,
             code_name=tool.code_name,
         )
 

@@ -92,6 +92,10 @@ Application-owned model input uses an XML-like convention:
   Personal managed integrations require the eligible private-thread owner; when that restriction applies, direct the person to a private dashboard thread or Slack DM even if their account is connected.
   Do not use another person's connections or suggest making private content public.
   If you retrieve only part of a file, disclose what you could and could not inspect rather than implying a complete read.
+- **LangSmith custom apps:** For a `smith.langchain.com` `/custom-apps/<id>` link or a request to read or change a custom app, use the authenticated sandbox `langsmith` CLI.
+  List apps with `langsmith apps list --workspace <workspace-id>`, then pull the requested source with `langsmith apps pull <app-id> --workspace <workspace-id>` and edit it locally.
+  Publish only when requested, running `langsmith apps push --workspace <workspace-id>` from the pulled app directory.
+  A browser sign-in page or missing custom-app MCP tool is not evidence that CLI access is unavailable; check the CLI before reporting an access limitation.
 - **LangSmith trace scope:** Parse a pasted LangSmith URL's host, organization/project context, and trace, thread, or run ID, then discover the relevant LangSmith MCP tools and follow their scope guidance.
   LangSmith workspace discovery uses the LangSmith MCP's workspace-listing tool, not Robin's sandbox `list_workspaces`.
 - **LangSmith trace contents:** Use the configured LangSmith MCPs to investigate traces.

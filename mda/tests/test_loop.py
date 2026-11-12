@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
@@ -550,6 +551,95 @@ async def test_an_answer_that_owes_a_slack_reply_is_asked_again_then_posted_for_
         ("reply_on_behalf", "Fixed the login.")
     ]
     assert on_the_web == PhaseResult()
+
+
+@pytest.mark.parametrize(
+    "error", ["not_in_channel", "channel_not_found", "missing_slack_bot_token"]
+)
+@pytest.mark.parametrize("error_key", ["error", "slack_error"])
+@pytest.mark.parametrize("source", ["final_reply", "earlier_answer", "progress_reply"])
+async def test_terminal_reply_failure_keeps_the_answer_on_the_web(
+    monkeypatch: pytest.MonkeyPatch, error: str, error_key: str, source: str
+) -> None:
+    backend, calls = _backend(monkeypatch, {}, LoopRules(reply=_REPLY))
+    loop = RunLoop(backend)
+    answer = "Merged the fix and pushed the branch."
+    progress = source == "progress_reply"
+    messages: list[BaseMessage] = [
+        HumanMessage(content="Fix it", id="human-1"),
+        AIMessage(
+            content=answer if source == "earlier_answer" else "",
+            tool_calls=[
+                {
+                    "name": "slack_reply",
+                    "args": {
+                        "message": (
+                            "Looking into it."
+                            if progress
+                            else answer
+                            if source == "final_reply"
+                            else ""
+                        ),
+                        "response_type": "progress" if progress else "final",
+                    },
+                    "id": "reply-1",
+                }
+            ],
+        ),
+        ToolMessage(
+            content=json.dumps({"success": False, error_key: error}), tool_call_id="reply-1"
+        ),
+    ]
+    if progress:
+        messages.append(AIMessage(content=answer, id="ai-answer"))
+    messages.append(AIMessage(content="", id="ai-final"))
+    state = _state(*messages, reply_surface="slack", reply_nudges=_REPLY.max_nudges)
+
+    result = await loop.after_model(state)
+
+    assert result.jump_to is None
+    assert result.update == {"reply_surface": "web", "reply_nudges": 0}
+    [restored] = messages_from_dict(result.messages)
+    assert restored.id == "ai-final" and restored.content == answer
+    assert calls == []
+
+    visible = AIMessage(content="The fix is complete.", id="ai-final")
+    preserved = await loop.after_model(_state(*messages[:-1], visible, **result.update))
+    assert preserved.jump_to is None and preserved.messages == []
+    assert calls == []
+
+
+@pytest.mark.parametrize("tool_name", ["slack_reply", "other_tool"])
+async def test_only_terminal_failures_of_the_reply_tool_disable_slack(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    backend, calls = _backend(monkeypatch, {}, LoopRules(reply=_REPLY))
+    result = await RunLoop(backend).after_model(
+        _state(
+            HumanMessage(content="Fix it", id="human-1"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": tool_name, "args": {"response_type": "final"}, "id": "reply-1"}
+                ],
+            ),
+            ToolMessage(
+                content=json.dumps(
+                    {
+                        "success": False,
+                        "error": "rate_limited" if tool_name == "slack_reply" else "not_in_channel",
+                    }
+                ),
+                tool_call_id="reply-1",
+            ),
+            AIMessage(content="Fixed it.", id="ai-final"),
+            reply_surface="slack",
+        )
+    )
+
+    assert result.jump_to == "model"
+    assert result.update == {"reply_nudges": 1}
+    assert calls == []
 
 
 @pytest.mark.parametrize("surface", ["slack", "web"])

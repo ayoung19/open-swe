@@ -328,7 +328,9 @@ async def test_code_channel_reply_stays_in_user_started_thread(
     }
 
 
-@pytest.mark.parametrize("slack_error", ["channel_not_found", "not_in_channel"])
+@pytest.mark.parametrize(
+    "slack_error", ["channel_not_found", "not_in_channel", "missing_slack_bot_token"]
+)
 async def test_slack_reply_hints_not_to_retry_channel_errors(
     slack_error: str,
     monkeypatch: pytest.MonkeyPatch,

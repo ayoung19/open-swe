@@ -29,6 +29,10 @@ from pydantic import BaseModel, Field, JsonValue
 from runtime_api.endpoint import CHANNEL_API_PREFIX, Endpoint
 from runtime_api.operations import RunRequest
 
+TERMINAL_SLACK_REPLY_ERRORS: Final = frozenset(
+    {"not_in_channel", "channel_not_found", "missing_slack_bot_token"}
+)
+
 
 class SlackMessage(BaseModel):
     """A Slack message the channel received, on its conversation's thread."""

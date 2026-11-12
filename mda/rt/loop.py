@@ -68,6 +68,7 @@ from runtime_api.model_errors import is_model_failure_reply
 from runtime_api.models import model_for
 from runtime_api.operations import RunRequest
 from runtime_api.provenance import Provenance
+from runtime_api.slack import TERMINAL_SLACK_REPLY_ERRORS
 
 from rt.backend import (
     OpenSweBackend,
@@ -254,6 +255,42 @@ class _Turn:
 
     def results(self) -> list[ToolMessage]:
         return [message for message in self.messages if isinstance(message, ToolMessage)]
+
+    def undeliverable_replies(self, rules: ReplyRules) -> set[str]:
+        call_ids = {str(call.get("id")) for call in self.calls() if call.get("name") == rules.tool}
+        return {
+            result.tool_call_id
+            for result in self.results()
+            if result.tool_call_id in call_ids
+            and isinstance(payload := _json_payload(result), dict)
+            and payload.get("success") is False
+            and any(
+                isinstance(error := payload.get(key), str) and error in TERMINAL_SLACK_REPLY_ERRORS
+                for key in ("slack_error", "error")
+            )
+        }
+
+    def undelivered_answer(self, rules: ReplyRules, failed: set[str]) -> str:
+        for message in reversed(self.messages):
+            if not isinstance(message, AIMessage):
+                continue
+            for tool_call in reversed(message.tool_calls):
+                if (
+                    tool_call.get("id") in failed
+                    and (args := tool_call.get("args", {})).get("response_type") == "final"
+                    and isinstance(text := args.get("message"), str)
+                    and text.strip()
+                ):
+                    return text
+            if any(
+                tool_call.get("name") == rules.tool
+                and tool_call.get("args", {}).get("response_type") == "progress"
+                for tool_call in message.tool_calls
+            ):
+                continue
+            if text := content_text(message.content).strip():
+                return text
+        return ""
 
     def last_answer(self) -> str:
         for message in reversed(self.messages):
@@ -591,23 +628,51 @@ class RunLoop:
         """Ask again for the CLI result, then the reply an answer owes."""
         messages = state.get("messages")
         last = messages[-1] if isinstance(messages, list) and messages else None
-        if not isinstance(last, AIMessage) or last.tool_calls:
+        if not isinstance(last, AIMessage):
             return PhaseResult()
-        held = _held(state)
+        terminal = self._undeliverable_reply(state, last)
+        if last.tool_calls:
+            return terminal or PhaseResult()
         update: dict[str, JsonValue] = {}
+        if terminal is not None:
+            update.update(terminal.update)
+        held = {**_held(state), **update}
         if is_model_failure_reply(last):
             # Asking the model again would wait out the same outage or refusal: what was
             # written for it is the run's answer.
             if self.rules.reply is not None and held.get("reply_surface") == "slack":
                 await self._reply_on_behalf(state, content_text(last.content))
-            return PhaseResult(update={"reply_nudges": 0, "cli_result_nudges": 0})
+            return PhaseResult(update={**update, "reply_nudges": 0, "cli_result_nudges": 0})
         if self.rules.cli_result is not None:
             asked = self._cli_result(self.rules.cli_result, state, held, update)
             if asked is not None:
                 return asked
+        if terminal is not None:
+            return terminal.model_copy(update={"update": update})
         if self.rules.reply is not None:
             return await self._reply(self.rules.reply, state, held, update)
         return PhaseResult(update=update)
+
+    def _undeliverable_reply(
+        self, state: Mapping[str, object], last: AIMessage
+    ) -> PhaseResult | None:
+        rules = self.rules.reply
+        if rules is None:
+            return None
+        turn = _Turn(_messages(state), self._guards)
+        failed = turn.undeliverable_replies(rules)
+        if not failed:
+            return None
+        update: dict[str, JsonValue] = {"reply_surface": "web", "reply_nudges": 0}
+        restored: list[AIMessage] = []
+        if not last.tool_calls and not content_text(last.content).strip():
+            if text := turn.undelivered_answer(rules, failed):
+                restored.append(last.model_copy(update={"content": text}))
+            else:
+                return PhaseResult(update=update, jump_to="model")
+        return PhaseResult(
+            update=update, messages=_json_dicts.validate_python(messages_to_dict(restored))
+        )
 
     def _nudge(self, rules: Nudging, state: Mapping[str, object]) -> list[dict[str, JsonValue]]:
         seen = {content_text(message.content) for message in visible_messages(state)}

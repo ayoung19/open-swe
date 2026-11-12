@@ -1443,3 +1443,48 @@ async def test_publish_review_fetches_pr_diff_when_diff_line_set_missing() -> No
     assert {c["path"] for c in retry_inline} == {"in_diff.py"}
     assert result["success"] is True
     assert result["unresolvable_findings"] == ["f_bad"]
+
+
+async def test_publication_keeps_trace_identity_when_comment_lookup_is_empty() -> None:
+    from langsmith import tracing_context
+    from langsmith.run_trees import RunTree
+
+    from openswe.review.publish import PublishSelection
+    from openswe.tools.publish_review import _current_run_id, _record_review_publication
+
+    root = RunTree(name="open-swe", run_type="chain")
+    child = root.create_child(name="publish_review", run_type="tool")
+    with tracing_context(parent=child):
+        trace_id = _current_run_id({"run_id": "agent-server-run"})
+    assert trace_id == str(root.id)
+
+    finding = new_finding(
+        severity="high",
+        confidence="high",
+        category="correctness",
+        file="app.py",
+        start_line=1,
+        end_line=1,
+        description="Missing validation",
+        sha="abc",
+    )
+    with (
+        patch(
+            "openswe.tools.publish_review.list_findings_async", AsyncMock(return_value=[finding])
+        ),
+        patch("openswe.tools.publish_review.replace_findings", AsyncMock()) as saved,
+    ):
+        await _record_review_publication(
+            thread_id="tid",
+            review_id=42,
+            inline_with_payload=[(finding, {})],
+            comment_records=[],
+            langgraph_run_id=trace_id,
+        )
+    persisted = saved.await_args.args[1][0]
+    assert persisted["github_review_run_id"] == str(root.id)
+    assert persisted["github_review_id"] == 42
+    assert (
+        PublishSelection([persisted], destination="github", re_review=True, head_sha="abc").postable
+        == []
+    )

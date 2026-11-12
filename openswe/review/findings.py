@@ -37,10 +37,13 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, selectinload
 from openswe.database import postgres
 from openswe.database.orm import NOW, Base
 from openswe.github.pull_request_key import PullRequestKey
+from openswe.jobs import queue
+from openswe.jobs.queue import Job
 from openswe.run_config import RunConfig
 from openswe.thread_ids import mda_successor_thread_id
 from openswe.ui_invalidations import Topic
 from openswe.users.models import UserIdentity
+from openswe.utils.langsmith import create_langsmith_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +500,33 @@ class FindingState(Base):
     )
     reviewer_thread_id: Mapped[str]
     created_at: Mapped[datetime | None] = mapped_column(server_default=NOW, init=False)
+
+    FEEDBACK_JOB = "review_findings_feedback"
+    FEEDBACK_KEY = "findings_acted_on"
+
+    @classmethod
+    async def schedule_feedback(cls, thread_id: str) -> None:
+        await queue.coalesce(
+            cls.FEEDBACK_JOB,
+            {"thread_id": thread_id},
+            key=f"{cls.FEEDBACK_JOB}:{thread_id}",
+        )
+
+    @classmethod
+    async def refresh_feedback(cls, job: Job) -> None:
+        thread_id = job.payload.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ValueError("Review findings feedback requires a thread id")
+        findings = await list_findings(thread_id, strict=True)
+        by_run: dict[str, list[Finding]] = {}
+        for finding in findings:
+            run_id = finding.get("github_review_run_id")
+            if run_id and finding.get("github_review_id") is not None:
+                by_run.setdefault(run_id, []).append(finding)
+        for run_id, published in by_run.items():
+            score = sum(finding["status"] == "resolved" for finding in published) / len(published)
+            if not await create_langsmith_feedback(run_id, cls.FEEDBACK_KEY, score=score):
+                raise RuntimeError("Could not save review findings feedback")
 
 
 class InteractionRow(Base):
@@ -1004,6 +1034,8 @@ async def mutate_findings(
             thread_id, PullRequestKey.of(pull.owner, pull.repo, pull.number)
         ).finding_changes(before, changed)
     await _record_finding_telemetry(thread_id, changed)
+    if any(finding.get("github_review_run_id") for finding in changed):
+        await FindingState.schedule_feedback(thread_id)
     return findings
 
 

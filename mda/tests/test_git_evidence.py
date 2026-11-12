@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -127,3 +130,128 @@ async def test_the_script_sees_more_edits_to_an_already_dirty_checkout(
     assert recovered.changes_since(before) == []
     with pytest.raises(SandboxScriptError, match="Could not inspect workspace git state"):
         await script.run(sandbox, {"root": str(tmp_path / "missing")})
+
+
+async def test_fingerprints_leave_a_stale_index_untouched_and_allow_fast_forward_pulls(
+    tmp_path: Path, sandbox: LocalShellBackend
+) -> None:
+    upstream = _checkout(tmp_path, "upstream", "https://github.com/org/actual.git")
+    repo = tmp_path / "repo"
+    _git("clone", str(upstream), str(repo))
+    _git("-C", str(repo), "remote", "set-url", "origin", "https://github.com/org/actual.git")
+    os.utime(repo / "file", (1, 1))
+    index = repo / ".git" / "index"
+    before = (index.read_bytes(), index.stat().st_mtime_ns)
+    script = SandboxScript("git_trace.py")
+    await script.run(sandbox, {"root": str(repo)})
+    assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+    for number in range(5):
+        (upstream / "new").write_text(str(number))
+        _git("-C", str(upstream), "add", "new")
+        _git("-C", str(upstream), "commit", "-m", "advance")
+        os.utime(repo / "file", (number + 1, number + 1))
+        _, pull = await asyncio.gather(
+            script.run(sandbox, {"root": str(repo)}),
+            sandbox.aexecute(
+                f"git -C {shlex.quote(str(repo))} pull --ff-only {shlex.quote(str(upstream))} work"
+            ),
+        )
+        assert pull.exit_code == 0, pull.output
+        assert (repo / "new").read_text() == str(number)
+        assert not (repo / ".git" / "index.lock").exists()
+
+
+async def test_staged_unstaged_and_untracked_content_remain_distinguishable(
+    tmp_path: Path, sandbox: LocalShellBackend
+) -> None:
+    repo = _checkout(tmp_path, "repo", "https://github.com/org/actual.git")
+    script = SandboxScript("git_trace.py")
+    fingerprints: list[object] = []
+    for content in (b"staged", b"initial", b"unstaged", b"more unstaged", b"\0binary", b"\0edited"):
+        (repo / "file").write_bytes(content)
+        if content == b"staged":
+            _git("-C", str(repo), "add", "file")
+        fingerprints.append(await script.run(sandbox, {"root": str(repo)}))
+    (repo / "untracked").write_text("new")
+    fingerprints.append(await script.run(sandbox, {"root": str(repo)}))
+    assert all(left != right for left, right in zip(fingerprints, fingerprints[1:], strict=False))
+
+
+async def test_tools_and_fingerprints_exclude_each_other_in_both_orders(
+    tmp_path: Path, sandbox: LocalShellBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready, scanning, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def scan(*args: object, **kwargs: object) -> dict[str, object]:
+        scanning.set()
+        await finish.wait()
+        scanning.clear()
+        return {"repos": {}}
+
+    async def setup() -> None:
+        await ready.wait()
+
+    monkeypatch.setattr(SandboxScript, "run", scan)
+    git = TurnGit()
+    git.start(sandbox, str(tmp_path), setup)
+    tool = asyncio.create_task(git.changing())
+    await asyncio.sleep(0)
+    assert not tool.done()
+    assert not scanning.is_set()
+    ready.set()
+    await scanning.wait()
+    assert not tool.done()
+    finish.set()
+    await tool
+    git.changed(1)
+
+    finish.clear()
+    git.settle()
+    await scanning.wait()
+    tool = asyncio.create_task(git.changing())
+    await asyncio.sleep(0)
+    assert not tool.done()
+    finish.set()
+    await tool
+    # Another parallel tool may finish while execute is still running.
+    await git.changing()
+    git.changed(2)
+    finish.clear()
+    git.settle()
+    await asyncio.sleep(0)
+    assert not scanning.is_set()
+    git.changed(3)
+    git.settle()
+    await scanning.wait()
+    finish.set()
+    await git.metadata()
+
+
+async def test_scan_deadline_reaps_git_before_a_tool_can_proceed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _checkout(tmp_path, "repo", "https://github.com/org/actual.git")
+    pid_file = tmp_path / "pids"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command = bin_dir / "git"
+    command.write_text(f"#!/bin/sh\necho $$ >> {shlex.quote(str(pid_file))}\nexec sleep 60\n")
+    command.chmod(0o755)
+    sandbox = LocalShellBackend(virtual_mode=False, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    script = SandboxScript("git_trace.py")
+    source = (
+        (Path(__file__).parents[1] / "rt/sandbox_scripts/git_trace.py")
+        .read_text()
+        .replace("DEADLINE_SECONDS = 20", "DEADLINE_SECONDS = 0.2")
+    )
+    script.__dict__["_source"] = shlex.quote(base64.b64encode(source.encode()).decode())
+    monkeypatch.setattr("rt.git_evidence._SCRIPT", script)
+    git = TurnGit()
+    git.start(sandbox, str(tmp_path))
+    await asyncio.wait_for(git.changing(), 5)
+    assert pid_file.exists()
+    for pid in pid_file.read_text().splitlines():
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid), 0)
+    git.changed(1)

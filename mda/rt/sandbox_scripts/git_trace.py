@@ -37,6 +37,7 @@ class Git:
         try:
             return subprocess.run(
                 ["git", "--no-optional-locks", "-C", str(path), *args],
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=remaining,
@@ -63,7 +64,19 @@ class Checkout:
         self.remote = git.start(path, "remote", "get-url", "origin")
         self.head = git.start(path, "rev-parse", "--verify", "HEAD")
         self.branch = git.start(path, "branch", "--show-current")
-        self.diff = git.start(path, "diff", "--no-ext-diff", "--no-textconv", "HEAD")
+        self.staged = git.start(
+            path,
+            "diff-index",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        )
+        self.unstaged = git.start(
+            path, "diff-files", "--binary", "--no-ext-diff", "--no-textconv", "--"
+        )
         self.untracked = git.start(path, "ls-files", "--others", "--exclude-standard", "-z")
 
     def fingerprint(self) -> Optional[Dict[str, str]]:
@@ -78,7 +91,9 @@ class Checkout:
         head = output(self.head, optional=True).decode().strip()
         if not head:
             return None
-        digest = hashlib.sha256(output(self.diff))
+        digest = hashlib.sha256(output(self.staged))
+        digest.update(b"\0")
+        digest.update(output(self.unstaged))
         for name in output(self.untracked).split(b"\0"):
             if name:
                 try:

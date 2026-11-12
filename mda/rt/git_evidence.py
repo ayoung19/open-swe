@@ -3,14 +3,14 @@
 The checkouts under the run's work dir are fingerprinted in the thread's sandbox
 (``sandbox_scripts/git_trace.py``): once as the turn starts, and again before a
 model call that follows a file or shell tool, each in the background. A tool that
-may change a checkout first waits for the starting fingerprint, so that never sees
-the tool's own change. Pull requests the run's operations open or find name the
+may change a checkout waits for any active fingerprint; new scans wait until all
+such tools have finished. Pull requests the run's operations open or find name the
 branch a repository's work went to.
 
 Once the run has ended, the targets are reconciled in the order the work happened
 (``TurnTrace.end``): the first is the trace's ``ls_git_repo`` and ``ls_git_branch``,
 a pull request's head branch preferred for its repository. Nothing waits for a
-fingerprint but a tool that may change a checkout, and only for the first.
+fingerprint but a tool that may change a checkout.
 """
 
 import asyncio
@@ -78,6 +78,7 @@ class TurnGit:
         self._fingerprinting: asyncio.Task[None] | None = None
         # When the first change no fingerprint has seen yet was made.
         self._changed_at: int | None = None
+        self._changing = 0
         self._observed: list[_Observed] = []
 
     def start(
@@ -98,18 +99,23 @@ class TurnGit:
         self._baseline = asyncio.ensure_future(self._first_fingerprint(ready))
 
     async def changing(self) -> None:
-        """Wait for the turn's starting fingerprint, before a tool that may change a checkout."""
+        """Wait for active fingerprints and reserve the checkout for a tool."""
         if self._baseline is not None:
             await asyncio.shield(self._baseline)
+        while self._busy:
+            assert self._fingerprinting is not None
+            await asyncio.shield(self._fingerprinting)
+        self._changing += 1
 
     def changed(self, at: int) -> None:
         """A tool that may have changed a checkout ran, starting at ``at``."""
+        self._changing -= 1
         if self._baseline is not None and self._changed_at is None:
             self._changed_at = at
 
     def settle(self) -> None:
         """Fingerprint, in the background, what tools changed since the last fingerprint."""
-        if self._changed_at is None or self._busy:
+        if self._changed_at is None or self._busy or self._changing:
             return
         at, self._changed_at = self._changed_at, None
         self._fingerprinting = asyncio.ensure_future(self._observe(at))

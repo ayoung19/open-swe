@@ -10,7 +10,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from openswe import event_claims
 from openswe.github.pull_request_key import PullRequestKey
-from openswe.review.findings import Finding
+from openswe.review.findings import Finding, FindingState
 from openswe.run_config import RunConfig
 from openswe.threads.store import THREADS
 from openswe.webhooks.event_log import RETAINED_DAYS, EventLog, EventRefs
@@ -76,6 +76,7 @@ class ReviewEvents:
             thread = await THREADS.get(thread_id)
             if thread is None or thread.metadata.get("kind") != "reviewer":
                 return
+            await FindingState.schedule_feedback(thread_id)
             pr = thread.metadata.get("pr")
             if not isinstance(pr, dict):
                 return

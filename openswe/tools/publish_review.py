@@ -7,6 +7,7 @@ from typing import Annotated, Any
 import httpx2
 from langgraph.config import get_config
 from langgraph.prebuilt import InjectedState
+from langsmith import get_current_run_tree
 from pydantic import JsonValue, TypeAdapter
 
 from openswe.analytics.usage import record_reviewer_publication
@@ -976,7 +977,7 @@ def _apply_comment_ids(
             comment_ids.append(comment_id)
             finding["github_review_comment_ids"] = comment_ids
         mark_surfaced(finding)
-        if langgraph_run_id:
+        if langgraph_run_id and not finding.get("github_review_run_id"):
             finding["github_review_run_id"] = langgraph_run_id
         updated = True
     return updated
@@ -1051,6 +1052,11 @@ async def _record_review_publication(
         )
         or changed
     )
+    for finding in latest:
+        if finding["id"] in review_finding_ids and langgraph_run_id:
+            if not finding.get("github_review_run_id"):
+                finding["github_review_run_id"] = langgraph_run_id
+                changed = True
     if changed:
         await replace_findings(thread_id, latest)
 
@@ -1314,6 +1320,8 @@ async def _resolve_threads_for_resolved_findings(
 
 
 def _current_run_id(config: Mapping[str, Any]) -> str | None:
+    if (run := get_current_run_tree()) is not None:
+        return str(run.trace_id)
     candidates = [config.get("run_id"), RunConfig.from_config(config).run_id]
     for candidate in candidates:
         if isinstance(candidate, str) and candidate:

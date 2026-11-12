@@ -112,3 +112,63 @@ async def test_upsert_finding_outcome_updates_on_conflict(monkeypatch) -> None: 
     assert ok
     assert not fake.created
     assert len(fake.updated) == 1
+
+
+async def test_trace_feedback_tracks_published_findings_after_delayed_outcomes() -> None:
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+    from uuid import uuid4
+
+    from openswe.jobs.queue import Job
+    from openswe.review import findings as finding_store
+    from openswe.review.findings import FindingState
+
+    published = [
+        {**_finding(), "id": "first", "github_review_id": 10, "status": "open"},
+        {**_finding(), "id": "second", "github_review_id": 10, "status": "open"},
+        {
+            **_finding(),
+            "id": "later-review",
+            "github_review_id": 11,
+            "github_review_run_id": "run_2",
+            "status": "dismissed",
+        },
+        {**_finding(), "id": "unpublished", "github_review_id": None, "status": "resolved"},
+    ]
+    job = Job(
+        id=uuid4(),
+        kind=FindingState.FEEDBACK_JOB,
+        payload={"thread_id": "reviewer-thread"},
+        due_at=datetime.now(UTC),
+        cron=None,
+        timezone="UTC",
+        key=None,
+        metadata={},
+        attempts=0,
+        created_at=datetime.now(UTC),
+    )
+    with (
+        patch.object(finding_store, "list_findings", AsyncMock(return_value=published)),
+        patch.object(
+            finding_store, "create_langsmith_feedback", AsyncMock(return_value=True)
+        ) as saved,
+    ):
+        await FindingState.refresh_feedback(job)
+        assert [(call.args, call.kwargs["score"]) for call in saved.await_args_list] == [
+            (("run_1", "findings_acted_on"), 0.0),
+            (("run_2", "findings_acted_on"), 0.0),
+        ]
+        published[0]["status"] = "resolved"
+        saved.reset_mock()
+        await FindingState.refresh_feedback(job)
+        assert [(call.args, call.kwargs["score"]) for call in saved.await_args_list] == [
+            (("run_1", "findings_acted_on"), 0.5),
+            (("run_2", "findings_acted_on"), 0.0),
+        ]
+        published[1]["status"] = "resolved"
+        await FindingState.refresh_feedback(job)
+        assert saved.await_args_list[-2].kwargs["score"] == 1.0
+        published.clear()
+        saved.reset_mock()
+        await FindingState.refresh_feedback(job)
+        saved.assert_not_awaited()

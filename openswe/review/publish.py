@@ -362,7 +362,9 @@ class PublishSelection:
     def _published(finding: Finding, destination: ReviewDestination) -> bool:
         match destination:
             case "github":
-                return bool(comment_ids_for_finding(finding))
+                return bool(comment_ids_for_finding(finding)) or (
+                    review_id_for_finding(finding) is not None
+                )
             case "shadow":
                 # A shadow's findings never reach GitHub; its publish marks the ones it would post.
                 return is_surfaced(finding)

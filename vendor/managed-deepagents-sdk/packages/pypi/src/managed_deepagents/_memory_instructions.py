@@ -28,6 +28,7 @@ __all__ = [
 
 # Replace native memory in its slot after Deep Agents' prompt-cache middleware.
 MEMORY_INSTRUCTIONS_MIDDLEWARE_NAME = "MemoryMiddleware"
+_ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
 
 
 def managed_memory_instructions(memory: MemoryLayers) -> str:
@@ -94,7 +95,19 @@ def append_memory_instructions(
 
         # Match native MemoryMiddleware, including middleware-level model fallback.
         if isinstance(model, ChatAnthropic):
-            block = cast("ContentBlock", {**block, "cache_control": {"type": "ephemeral"}})
+            breakpoints = sum("cache_control" in item for item in blocks)
+            breakpoints += sum(
+                isinstance(item, dict) and "cache_control" in item
+                for message in request.messages
+                if isinstance(message.content, list)
+                for item in message.content
+            )
+            breakpoints += sum(
+                isinstance(tool, dict) and "cache_control" in tool for tool in request.tools
+            )
+            breakpoints += int("cache_control" in request.model_settings)
+            if breakpoints < _ANTHROPIC_MAX_CACHE_BREAKPOINTS:
+                block = cast("ContentBlock", {**block, "cache_control": {"type": "ephemeral"}})
     blocks.append(block)
     return request.override(system_message=SystemMessage(content_blocks=blocks))
 

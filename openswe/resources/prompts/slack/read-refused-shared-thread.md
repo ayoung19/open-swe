@@ -1,3 +1,4 @@
-Slack reading is off in this thread because other people can read it, and Slack content read here would be visible to all of them.
-Tell the person that, and that they can either ask again in a private dashboard thread or a Slack DM with Robin, or paste the Slack messages they want you to read here.
-Do not try to open the Slack link another way.
+Channel history can be read in a shared human Slack run only when its current channel and the requested channel are both verified public and internal.
+This run has no verified public internal source channel, so Slack content cannot be read here with the workspace bot's access.
+Tell the person they can ask again in a private dashboard thread or an authenticated Slack DM with Robin, or paste the Slack messages they want you to read here.
+Do not try to bypass this refusal through another route.

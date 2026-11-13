@@ -223,3 +223,109 @@ async def test_bot_channel_history_is_scoped_and_revocable(
 
     metadata["source_context"] = {}
     assert (await slack_read_channel_messages("C1"))["success"] is False
+
+
+@pytest.mark.parametrize(
+    "private,slack_thread",
+    [(False, _SLACK), (True, None), (True, {"channel_id": "D1", "thread_ts": "1.0"})],
+)
+async def test_human_channel_history_reads_public_internal_targets(
+    metadata: dict[str, object],
+    slack: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    slack_api: SlackAPI,
+    private: bool,
+    slack_thread: dict[str, str] | None,
+) -> None:
+    from openswe.slack.tools.read_channel_messages import slack_read_channel_messages
+
+    metadata.update(visibility="private" if private else "public", owner_login="alice")
+    cfg = _cfg(source="slack" if slack_thread else "dashboard", slack_thread=slack_thread)
+    monkeypatch.setattr(tool_access, "configurable", lambda: cfg)
+    for channel_id in ["C2"] if private else ["C1", "C2"]:
+        slack_api.respond(
+            {
+                "ok": True,
+                "channel": {
+                    "id": channel_id,
+                    "is_channel": True,
+                    "is_private": False,
+                    "is_ext_shared": False,
+                    "is_pending_ext_shared": False,
+                },
+            }
+        )
+    slack_api.respond({"ok": True, "messages": [{"ts": "0.5", "text": "Public discussion"}]})
+    result = await slack_read_channel_messages("C2")
+    assert result["success"] is True
+    assert result["count"] == 1
+    assert "Public discussion" in str(result["formatted"])
+
+
+@pytest.mark.parametrize("failed_channel", ["C1", "C2"])
+@pytest.mark.parametrize(
+    "restriction",
+    ["is_private", "is_ext_shared", "is_pending_ext_shared", "missing", "unknown", "unavailable"],
+)
+async def test_human_channel_history_refuses_unverified_source_or_target(
+    metadata: dict[str, object],
+    slack: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    slack_api: SlackAPI,
+    failed_channel: str,
+    restriction: str,
+) -> None:
+    from openswe.slack.tools.read_channel_messages import slack_read_channel_messages
+
+    monkeypatch.setattr(
+        tool_access, "configurable", lambda: _cfg(source="slack", slack_thread=_SLACK)
+    )
+    for channel_id in ["C1"] if failed_channel == "C1" else ["C1", "C2"]:
+        payload: dict[str, object] = {
+            "id": channel_id,
+            "is_channel": True,
+            "is_private": False,
+            "is_ext_shared": False,
+            "is_pending_ext_shared": False,
+        }
+        if channel_id == failed_channel:
+            if restriction == "missing":
+                slack_api.respond({"ok": False, "error": "channel_not_found"})
+                continue
+            if restriction == "unavailable":
+                slack_api.respond({"ok": False, "error": "internal_error"}, status=503)
+                continue
+            if restriction == "unknown":
+                del payload["is_ext_shared"]
+            else:
+                payload[restriction] = True
+        slack_api.respond({"ok": True, "channel": payload})
+    result = await slack_read_channel_messages("C2")
+    assert result["success"] is False
+    assert result["error"]
+    assert all(method != "conversations.history" for method, _ in slack_api.calls)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"source": "slack"},
+        {"source": "slack", "slack_thread": {"channel_id": "C1"}},
+        {"source": "slack", "slack_thread": _SLACK, "github_login": None},
+        {"source": "slack", "slack_thread": _SLACK, "schedule_id": "s-1"},
+        {"source": "slack", "slack_thread": {**_SLACK, "triggering_bot_id": "B1"}},
+    ],
+)
+async def test_human_channel_history_requires_trusted_human_slack_context(
+    metadata: dict[str, object],
+    slack: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    slack_api: SlackAPI,
+    fields: dict[str, object],
+) -> None:
+    from openswe.slack.tools.read_channel_messages import slack_read_channel_messages
+
+    monkeypatch.setattr(tool_access, "configurable", lambda: _cfg(**fields))
+    assert (await slack_read_channel_messages("C2"))["success"] is False
+    assert not slack_api.calls

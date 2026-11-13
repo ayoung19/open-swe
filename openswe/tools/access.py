@@ -123,6 +123,7 @@ class Access:
     sole: bool = False
     direct: bool = False
     slack_bot_channel: str | None = None
+    slack_source_channel: str | None = None
     # The run was started from a Slack thread; the bot's own reach applies there.
     slack_context: bool = False
 
@@ -292,6 +293,18 @@ async def resolve_access(cfg: RunConfig | None = None, *, login: str | None = No
         sole=await sole_writer(cfg, metadata, login),
         direct=direct_user_run(cfg),
         slack_bot_channel=slack_bot_channel,
+        slack_source_channel=(
+            current_slack.channel_id
+            if (
+                scope.owner_type == "user"
+                and login
+                and direct_user_run(cfg)
+                and cfg.slack_context
+                and current_slack is not None
+                and not current_slack.triggering_bot_id
+            )
+            else None
+        ),
         slack_context=cfg.slack_context,
     )
 

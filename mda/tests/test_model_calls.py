@@ -5,6 +5,7 @@ from datetime import timedelta
 from typing import Protocol, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import anthropic
 import httpx
 import httpx2
 import openai
@@ -46,7 +47,7 @@ from rt.model_retries import ModelRetriesMiddleware
 from rt.models import ModelSpec, build_model
 from rt.run_prompt import RunPromptMiddleware, ThreadPromptMiddleware
 from runtime_api.catalog import Catalog
-from runtime_api.model_errors import is_model_failure_reply
+from runtime_api.model_errors import classify_exception, is_model_failure_reply
 
 _ANTHROPIC = ChatAnthropic(model_name="claude-opus-5-5", api_key=SecretStr("test"))
 _OPENAI = ChatOpenAI(
@@ -469,6 +470,109 @@ async def test_a_model_the_workspace_cannot_use_says_so() -> None:
     assert isinstance(content, str) and "OpenAI returned: The model does not exist." in content
     assert attempts.models == [_ANTHROPIC]
     assert is_model_failure_reply(answer.result[0])
+
+
+@pytest.mark.parametrize("sdk", [openai, anthropic])
+@pytest.mark.parametrize(
+    "status,detail,expected",
+    [
+        (402, "Gateway policy spend limit exceeded", "gateway policy or spend limit"),
+        (424, "Secret 'ANTHROPIC_API_KEY' not found", "`ANTHROPIC_API_KEY`"),
+        (401, "Invalid API key sk-sensitive123 (sk-***123)", "workspace was rejected"),
+        (403, "Permission denied", "does not have permission"),
+    ],
+)
+async def test_access_failures_explain_the_fix_without_exposing_credentials(
+    sdk: object, status: int, detail: str, expected: str
+) -> None:
+    body = {"error": {"message": detail, "key": "sk-sensitive123", "masked_key": "sk-***123"}}
+    response = httpx2.Response(status, request=httpx2.Request("POST", "https://gateway.invalid"))
+    error = (
+        openai.APIStatusError("provider error", response=response, body=body)
+        if sdk is openai
+        else anthropic.APIStatusError("provider error", response=response, body=body)
+    )
+    attempts = _Attempts(error)
+
+    answer = await call_with_fallback(ModelRequest(model=_ANTHROPIC, messages=[]), attempts, None)
+
+    assert classify_exception(error) == "model_unavailable"
+    content = answer.result[0].content
+    assert isinstance(content, str)
+    assert expected in content
+    assert "admin" in content and "model" in content
+    if status == 424:
+        assert "LangSmith workspace secrets" in content
+    assert "sk-sensitive123" not in content and "sk-***123" not in content
+    assert is_model_failure_reply(answer.result[0])
+    assert attempts.models == [_ANTHROPIC]
+
+
+@pytest.mark.parametrize(
+    "credential_error",
+    [
+        _status_error(401),
+        _status_error(424, {"error": {"message": "Missing secret: ANTHROPIC_API_KEY"}}),
+        _status_error(403, {"error": {"type": "permission_error"}}),
+    ],
+)
+@pytest.mark.parametrize(
+    "fallback_model,fallback_error",
+    [
+        (None, None),
+        (_ANTHROPIC, None),
+        (_OPENAI, None),
+        (_OPENAI, _status_error(503)),
+        (_OPENAI, _status_error(401)),
+    ],
+)
+async def test_credentials_only_try_a_different_provider_once(
+    credential_error: BaseException,
+    fallback_model: BaseChatModel | None,
+    fallback_error: BaseException | None,
+) -> None:
+    errors = [credential_error]
+    if fallback_error is not None:
+        errors.append(fallback_error)
+    attempts = _Attempts(*errors)
+
+    answer = await call_with_fallback(
+        ModelRequest(model=_ANTHROPIC, messages=[]),
+        attempts,
+        (lambda: fallback_model) if fallback_model is not None else None,
+        backoff_schedule=(0.0, 0.0, 0.0),
+    )
+
+    if fallback_model is _OPENAI:
+        assert attempts.models == [_ANTHROPIC, _OPENAI]
+    else:
+        assert attempts.models == [_ANTHROPIC]
+    if fallback_model is _OPENAI and fallback_error is None:
+        assert answer.result[0].content == "answered"
+    else:
+        assert is_model_failure_reply(answer.result[0])
+        assert "workspace" in str(answer.result[0].content)
+        assert "admin" in str(answer.result[0].content)
+
+
+@pytest.mark.parametrize(
+    "status,body",
+    [
+        (402, {"error": {"message": "Gateway policy blocked this call"}}),
+        (403, {"error": {"message": "Permission denied"}}),
+        (424, {"error": {"message": "Secret 'LANGSMITH_API_KEY' not found"}}),
+        (401, {"error": {"message": "Invalid LangSmith API key"}}),
+    ],
+)
+async def test_workspace_access_blocks_do_not_try_another_provider(
+    status: int, body: dict[str, object]
+) -> None:
+    attempts = _Attempts(_status_error(status, body))
+
+    answer = await _fallback_call(attempts)
+
+    assert is_model_failure_reply(answer.result[0])
+    assert attempts.models == [_ANTHROPIC]
 
 
 async def test_without_a_fallback_the_call_is_made_once() -> None:

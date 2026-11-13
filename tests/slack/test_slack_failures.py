@@ -3,8 +3,12 @@ import logging
 import uuid
 from unittest.mock import AsyncMock
 
+import httpx2
+import openai
 import pytest
+from runtime_api.model_errors import classify_exception, code_for_error_type
 
+from openswe import completion
 from openswe.slack import failures
 from openswe.slack.request import SlackRequest
 from openswe.slack.retry import SlackRetry
@@ -109,3 +113,52 @@ async def test_failure_retry_only_replays_explicitly_replayable_messages(
     retry = SlackRetry.from_value(json.loads(blocks[1]["elements"][0]["value"]))
     assert retry is not None
     assert retry.message_ts == ("1.5" if origin in {"message", "retry"} else "")
+
+
+@pytest.mark.parametrize(
+    "status,detail",
+    [
+        (401, "Invalid API key sk-sensitive123"),
+        (402, "Gateway policy blocked the call"),
+        (403, "Permission denied"),
+        (424, "Secret 'ANTHROPIC_API_KEY' not found"),
+    ],
+)
+async def test_model_access_completion_guides_model_change_without_retry(
+    monkeypatch: pytest.MonkeyPatch, status: int, detail: str
+) -> None:
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", "retry-test-secret-at-least-32-bytes")
+    reply = AsyncMock(return_value=True)
+    monkeypatch.setattr(completion, "post_slack_thread_reply", reply)
+    monkeypatch.setattr(completion, "get_langsmith_error_url", AsyncMock(return_value=None))
+    error = openai.APIStatusError(
+        "provider error",
+        response=httpx2.Response(status, request=httpx2.Request("POST", "https://gateway.invalid")),
+        body={"error": {"message": detail}},
+    )
+    metadata = {
+        "source": "slack",
+        "source_context": {
+            "slack_thread": {"channel_id": "C1", "thread_ts": "1.0", "triggering_user_id": "U1"}
+        },
+    }
+
+    await completion._post_failure_reply("t1", metadata, "error", classify_exception(error))
+
+    assert reply.await_args is not None
+    assert "Pick a different model" in reply.await_args.args[2]
+    assert "sk-sensitive123" not in reply.await_args.args[2]
+    assert reply.await_args.kwargs["blocks"] is None
+
+    for error_type in (
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "OpenAIAuthenticationError",
+        "OpenAIPermissionDeniedError",
+    ):
+        await completion._post_failure_reply(
+            "t1", metadata, "error", code_for_error_type(error_type)
+        )
+        assert reply.await_args is not None
+        assert "Pick a different model" in reply.await_args.args[2]
+        assert reply.await_args.kwargs["blocks"] is None

@@ -7,8 +7,10 @@ failed, while the exception is intact, and left on the thread for the reply to r
 """
 
 import json
+import re
 from collections.abc import Mapping
-from typing import Any, Final
+from dataclasses import dataclass
+from typing import Any, Final, Literal
 
 _MAX_BODY_CHARS: Final = 2000
 
@@ -25,6 +27,10 @@ MODEL_FAILURE_REPLY_KEY: Final = "open_swe_model_failure"
 # the platform serializes the class name but scrubs the message of any exception
 # type outside its allowlist.
 _ERROR_TYPE_CODES: Final = {
+    "AuthenticationError": "model_unavailable",
+    "PermissionDeniedError": "model_unavailable",
+    "OpenAIAuthenticationError": "model_unavailable",
+    "OpenAIPermissionDeniedError": "model_unavailable",
     "RateLimitError": "provider_rate_limited",
     "OverloadedError": "provider_overloaded",
     "APIConnectionError": "provider_unavailable",
@@ -44,6 +50,100 @@ _ERROR_TYPE_CODES: Final = {
 }
 
 
+@dataclass(frozen=True)
+class ModelAccessFailure:
+    reason: Literal["secret", "policy", "key", "permission"]
+    secret: str | None = None
+    provider_scoped: bool = False
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> ModelAccessFailure | None:
+        status = getattr(exc, "status_code", None)
+        body = getattr(exc, "body", None)
+        if (
+            not isinstance(status, int)
+            and type(exc).__name__ not in _ERROR_TYPE_CODES
+            and not isinstance(body, Mapping)
+        ):
+            return None
+        detail = f"{body} {exc}"
+        lowered = detail.lower()
+        missing_secret = "secret" in lowered and any(
+            word in lowered
+            for word in ("missing", "not found", "does not exist", "not configured", "not set")
+        )
+        policy = any(
+            word in lowered
+            for word in (
+                "policy",
+                "spend limit",
+                "spend_limit",
+                "spending limit",
+                "budget exceeded",
+            )
+        )
+        if missing_secret:
+            match = re.search(
+                r"(?i:secret(?:_name)?(?: with name)?)['\"]?\s*[:=]?\s*['\"`]?([A-Z][A-Z0-9_]{0,127})(?=['\"`\s,}]|$)",
+                detail,
+            )
+            secret = match.group(1) if match else None
+            return cls(
+                "secret",
+                secret,
+                bool(secret and secret.startswith(("ANTHROPIC_", "OPENAI_", "FIREWORKS_"))),
+            )
+        if status == 402 or policy:
+            return cls("policy")
+        if status == 401 or type(exc).__name__ in {
+            "AuthenticationError",
+            "OpenAIAuthenticationError",
+        }:
+            return cls("key", provider_scoped="langsmith" not in lowered)
+        if status in {403, 424} or type(exc).__name__ in {
+            "PermissionDeniedError",
+            "OpenAIPermissionDeniedError",
+        }:
+            return cls(
+                "permission",
+                provider_scoped=status == 403
+                and "langsmith" not in lowered
+                and any(
+                    word in lowered
+                    for word in (
+                        "provider key",
+                        "provider permission",
+                        "api key",
+                        "permission_error",
+                    )
+                ),
+            )
+        return None
+
+    def message(self) -> str:
+        if self.reason == "secret":
+            name = f" `{self.secret}`" if self.secret else " required by the selected model"
+            return (
+                f"The workspace secret{name} is missing. "
+                "A workspace admin must add it in LangSmith workspace secrets. "
+                "Choose another model or contact your workspace admin."
+            )
+        if self.reason == "policy":
+            return (
+                "A LangSmith gateway policy or spend limit blocked this model call. "
+                "Choose another model or ask your workspace admin to review the gateway policy and spend limits."
+            )
+        if self.reason == "key":
+            return (
+                "The provider key configured for the workspace was rejected. "
+                "Ask your workspace admin to update the workspace credentials, or choose another model."
+            )
+        return (
+            "The workspace does not have permission to call the selected model. "
+            "Choose another model or ask your workspace admin to check the workspace credentials and model access."
+        )
+
+
 def is_model_failure_reply(message: object) -> bool:
     """Whether ``message`` is the runtime's answer for a model call it could not make."""
     metadata = getattr(message, "response_metadata", None)
@@ -56,11 +156,9 @@ def code_for_error_type(error_type: str | None) -> str | None:
 
 
 def classify_exception(exc: BaseException) -> str | None:
-    """Failure code for a live exception, using status and provider error body.
-
-    Provider-agnostic on purpose: a gateway can surface an overload as anything
-    from a 529 to a bare ``APIError`` carrying ``overloaded_error`` in its body.
-    """
+    """Failure code for a live exception, using status and provider error body."""
+    if ModelAccessFailure.from_exception(exc) is not None:
+        return "model_unavailable"
     status = getattr(exc, "status_code", None)
     body = getattr(exc, "body", None)
     provider_code = ""

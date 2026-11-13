@@ -613,7 +613,7 @@ class BackendRunMiddleware(AgentMiddleware[RunState]):
             trace.record_model(model.model_id)
         fallback = planned.fallback
         if fallback is None:
-            return await handler(request)
+            return await call_with_fallback(request, handler, None)
 
         def attempting(on_fallback: bool) -> None:
             attempted = fallback if on_fallback else model

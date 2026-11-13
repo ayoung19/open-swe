@@ -36,7 +36,12 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langchain_fireworks import ChatFireworks
 from langchain_openai import ChatOpenAI
-from runtime_api.model_errors import MODEL_FAILURE_REPLY_KEY, classify_exception, exception_fields
+from runtime_api.model_errors import (
+    MODEL_FAILURE_REPLY_KEY,
+    ModelAccessFailure,
+    classify_exception,
+    exception_fields,
+)
 from runtime_api.models import MODEL_CALL_BUDGET
 
 from rt.model_retries import ModelOutput, ModelRetriesMiddleware
@@ -205,6 +210,9 @@ def _nested_str(data: dict[str, Any], *keys: str) -> str | None:
 
 def model_access_message(exc: BaseException) -> str | None:
     """What to tell the person when the workspace may not use the call's model."""
+    if isinstance(exc, (anthropic.APIStatusError, openai.APIStatusError)):
+        if failure := ModelAccessFailure.from_exception(exc):
+            return failure.message()
     if isinstance(exc, anthropic.BadRequestError):
         body = _error_body(exc)
         if _nested_str(body, "error", "details", "error_code") == "model_not_available":
@@ -239,16 +247,18 @@ async def call_with_fallback(
     backoff_schedule: Sequence[float] | None = None,
     budget: timedelta = MODEL_CALL_BUDGET,
 ) -> ModelResponse:
-    """``request``, and again while it fails transiently, alternating with ``fallback``.
-
-    Without a fallback the call is made once. ``attempting`` hears before each attempt
-    after the first whether it goes to the fallback; a fallback that cannot be built
-    leaves the retries to the call's own model. A provider that refuses the workspace
-    the model answers with why; any other error that is not transient raises at once.
-    Once the attempts or ``budget`` run out, the outage message answers instead.
-    """
+    """Retry transient failures and explain access failures after one eligible provider failover."""
     if fallback is None:
-        return await handler(request)
+        try:
+            return await handler(request)
+        except Exception as exc:
+            if (message := model_access_message(exc)) is None:
+                raise
+            logger.warning(
+                "Model access error surfaced to the person",
+                extra={"model_access_error": exception_fields(exc)},
+            )
+            return _failure_reply(message, "model_access")
     schedule = tuple(BACKOFF_SCHEDULE if backoff_schedule is None else backoff_schedule)
     clock = asyncio.get_running_loop()
     deadline = clock.time() + budget.total_seconds()
@@ -287,6 +297,31 @@ async def call_with_fallback(
                     "Model access error surfaced to the person",
                     extra={"model_access_error": exception_fields(exc)},
                 )
+                output.supersede()
+                failure = ModelAccessFailure.from_exception(exc)
+                if attempt == 0 and failure is not None and failure.provider_scoped:
+                    try:
+                        alternate = request.override(model=fallback())
+                        primary_provider = getattr(_chat_model(request.model), "_llm_type", None)
+                        alternate_provider = getattr(
+                            _chat_model(alternate.model), "_llm_type", None
+                        )
+                        if (
+                            primary_provider
+                            and alternate_provider
+                            and primary_provider != alternate_provider
+                        ):
+                            attempting(True)
+                            with output.tracking():
+                                async with asyncio.timeout_at(deadline):
+                                    return await handler(alternate)
+                    except Exception as fallback_exc:
+                        output.supersede()
+                        logger.warning(
+                            "Credential fallback failed",
+                            extra={"model_access_error": exception_fields(fallback_exc)},
+                        )
+                        message = model_access_message(fallback_exc) or message
                 return _failure_reply(message, "model_access")
             if not is_transient(exc):
                 raise

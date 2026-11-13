@@ -1548,6 +1548,75 @@ async def test_an_operation_code_mode_calls_is_reported_and_cited_under_its_eval
     assert recorded.content == result.content
 
 
+@pytest.mark.parametrize(("timeout", "expected"), [(10000, 3600), (0, 300), (-1, 300), (120, 120)])
+@pytest.mark.parametrize("code_mode", [False, True])
+async def test_execute_normalizes_timeout_before_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout: int, expected: int, code_mode: bool
+) -> None:
+    from deepagents.backends.protocol import ExecuteResponse
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+    from langchain.agents.middleware.types import ModelRequest
+
+    class RecordingShell(LocalShellBackend):
+        async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+            received.append(timeout)
+            return await super().aexecute(command, timeout=timeout)
+
+    monkeypatch.setenv("OPEN_SWE_BACKEND_URL", "https://backend.invalid")
+    for module in ("rt.middleware", "rt.tools"):
+        monkeypatch.setattr(f"{module}.run_id", lambda: "run-1")
+    backend = _run_backend(catalog=Catalog(sandbox=_IN_SANDBOX))
+    monkeypatch.setattr(backend.outbox, "started", MagicMock())
+    monkeypatch.setattr(backend.outbox, "finished", MagicMock())
+    received: list[int | None] = []
+    shell = RecordingShell(root_dir=tmp_path, virtual_mode=True)
+    execute = next(
+        tool for tool in FilesystemMiddleware(backend=shell).tools if tool.name == "execute"
+    )
+    files = FileToolsMiddleware(backend, 300, remote_files=MagicMock())
+    runtime = ToolRuntime(
+        state={"messages": []},
+        context=None,
+        config={},
+        stream_writer=lambda event: None,
+        tool_call_id="call-1",
+        store=None,
+    )
+    request = ToolCallRequest(
+        tool_call=ToolCall(
+            name="execute",
+            args={"command": "printf 'Robin diff'", "timeout": timeout},
+            id="call-1",
+            type="tool_call",
+        ),
+        tool=execute,
+        state=runtime.state,
+        runtime=runtime,
+    )
+
+    async def run(request: ToolCallRequest) -> ToolMessage:
+        result = await execute.ainvoke(
+            {**request.tool_call, "args": {**request.tool_call["args"], "runtime": runtime}}
+        )
+        assert isinstance(result, ToolMessage)
+        return result
+
+    if code_mode:
+        model_request = MagicMock(spec=ModelRequest)
+        model_request.tools = [execute]
+        await files.awrap_model_call(model_request, AsyncMock())
+        [code_execute] = files.code_tools(["execute"])
+        assert code_execute.coroutine is not None
+        result = await code_execute.coroutine(runtime=runtime, **request.tool_call["args"])
+    else:
+        result = await files.awrap_tool_call(request, run)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "success"
+    assert "Robin diff" in result.text
+    assert received == [expected]
+
+
 async def test_a_command_the_guards_refuse_is_recorded_with_their_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -76,6 +76,7 @@ _QUOTING: Final = re.compile(r"\\\n|[\"'\\]")
 # As the backend's sandbox: the client gives up on a command the sandbox never
 # answers 30 seconds past its own timeout.
 _EXECUTE_GRACE_SECONDS: Final = 30
+_MAX_EXECUTE_TIMEOUT_SECONDS: Final = 3600
 # A sandbox call rejected before it started cannot have run, so it is sent again.
 _TRANSIENT_BACKOFF_SECONDS: Final = (0.5, 1.0, 2.0)
 # What git, the GitHub CLI and the REST API print when GitHub refuses the token the
@@ -360,10 +361,18 @@ class FileToolsMiddleware(AgentMiddleware):
         self, request: ToolCallRequest, handler: Handler
     ) -> ToolMessage | Command:
         """Give up on a command the sandbox never answers, as the backend's sandbox does."""
-        timeout = request.tool_call["args"].get("timeout")
-        seconds = timeout if isinstance(timeout, int) else self._execute_timeout
-        if request.tool_call["name"] != "execute" or seconds <= 0:
+        if request.tool_call["name"] != "execute":
             return await handler(request)
+        timeout = request.tool_call["args"].get("timeout")
+        seconds = timeout if isinstance(timeout, int) and timeout > 0 else self._execute_timeout
+        seconds = min(seconds, _MAX_EXECUTE_TIMEOUT_SECONDS)
+        if isinstance(timeout, int):
+            request = request.override(
+                tool_call={
+                    **request.tool_call,
+                    "args": {**request.tool_call["args"], "timeout": seconds},
+                }
+            )
         deadline = seconds + _EXECUTE_GRACE_SECONDS
         try:
             return await asyncio.wait_for(handler(request), deadline)

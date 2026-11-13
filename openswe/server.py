@@ -1022,7 +1022,16 @@ _NOT_FROM_CODE = (
 # Everyday tools code mode still offers the model directly. Every other tool it calls
 # from code, where the run's tools can differ from person to person and run to run without
 # changing the tools offered to the model, which the provider's prompt cache keys on.
-_DIRECT_IN_CODE_MODE = SANDBOX_TOOL_NAMES | {SEARCH_TOOLS, "monitor", "web_search", "fetch_url"}
+_DIRECT_IN_CODE_MODE = SANDBOX_TOOL_NAMES | {
+    SEARCH_TOOLS,
+    "monitor",
+    "web_search",
+    "fetch_url",
+    "open_pull_request",
+    "background_task",
+    "expedite_pr_approval",
+    "create_sandbox_file_download_url",
+}
 
 
 def callable_from_code(name: str) -> bool:

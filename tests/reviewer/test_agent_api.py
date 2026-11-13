@@ -847,6 +847,47 @@ async def test_remote_prompts_include_deployment_context(
         assert subagent_prompt.endswith("subagent instructions")
 
 
+class TestWorkflowToolCatalog:
+    @staticmethod
+    async def operation() -> str:
+        return "done"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "open_pull_request",
+            "background_task",
+            "expedite_pr_approval",
+            "create_sandbox_file_download_url",
+            "background_execute",
+        ],
+    )
+    @pytest.mark.parametrize("available", [False, True])
+    async def test_code_mode_offers_only_available_workflow_tools(
+        self, name: str, available: bool
+    ) -> None:
+        from langchain_core.tools import StructuredTool
+
+        from openswe.agent_api.run_catalog import RunCatalog
+        from openswe.sandboxes.tool_runtime import ModelChoice, SurfaceModels
+
+        tool = StructuredTool.from_function(
+            coroutine=self.operation, name=name, description="Workflow operation"
+        )
+        choice = ModelChoice("openai:gpt-6.1-sol", {})
+        surface = ToolSurface(
+            base_tools=[tool] if available else [],
+            code_mode=True,
+            models=SurfaceModels(main=choice, subagent=choice, use_gateway=False),
+        )
+        await surface.prepare()
+        catalog = RunCatalog(RunKind(), RUN, surface, {}).build()
+
+        assert (name in {spec.name for spec in catalog.operations}) is available
+        assert name not in catalog.code_only
+        assert (name in catalog.also_from_code) is available
+
+
 async def test_app_lifespan_exits_without_managed_deep_agents(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

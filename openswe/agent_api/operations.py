@@ -221,7 +221,16 @@ class Operation:
         token = HELD_SESSIONS.set(held)
         try:
             result = await in_graph_context(
-                {**config, "run_name": request.name}, run, events=events
+                {
+                    **config,
+                    "run_name": request.name,
+                    "configurable": {
+                        **config.get("configurable", {}),
+                        "tool_spans": [span.model_dump(mode="json") for span in request.tool_spans],
+                    },
+                },
+                run,
+                events=events,
             )
         finally:
             HELD_SESSIONS.reset(token)

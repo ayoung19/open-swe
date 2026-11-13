@@ -523,7 +523,8 @@ def _build_langsmith_feedback_clients() -> tuple[tuple[str, str], ...]:
 
 
 def _feedback_id(run_id: str, key: str) -> uuid.UUID:
-    return uuid.uuid5(uuid.NAMESPACE_URL, f"langsmith-feedback:{run_id}:{key}")
+    name = f"{run_id}:{key}" if key == "finding_dismissed" else f"langsmith-feedback:{run_id}:{key}"
+    return uuid.uuid5(uuid.NAMESPACE_URL, name)
 
 
 async def create_langsmith_thread_feedback(

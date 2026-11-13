@@ -1,6 +1,16 @@
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
-from openswe.review.findings import Finding
+import pytest
+from langchain_core.tools import StructuredTool
+from langchain_core.tracers.langchain import LangChainTracer
+from langgraph.runtime import Runtime
+from langsmith import Client
+
+from openswe.agent_api.runs import in_graph_context
+from openswe.review.findings import Finding, FindingStatus
 from openswe.utils import reviewer_outcomes
 from openswe.utils.reviewer_outcomes import (
     FALSE_POSITIVE,
@@ -112,3 +122,71 @@ async def test_upsert_finding_outcome_updates_on_conflict(monkeypatch) -> None: 
     assert ok
     assert not fake.created
     assert len(fake.updated) == 1
+
+
+class TestFindingDismissalFeedback:
+    @pytest.mark.parametrize(
+        ("status", "age", "human", "expected"),
+        [
+            ("dismissed", 0, True, 1.0),
+            ("dismissed", 7 * 86400, True, 1.0),
+            ("dismissed", 7 * 86400 + 1, True, 0.0),
+            ("dismissed", -1, True, 0.0),
+            ("dismissed", 60, False, 0.0),
+            ("resolved", 60, True, 0.0),
+            ("open", 60, True, 0.0),
+        ],
+    )
+    async def test_feedback_scores_originating_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        status: FindingStatus,
+        age: int,
+        human: bool,
+        expected: float,
+    ) -> None:
+        feedback = AsyncMock(return_value=True)
+        monkeypatch.setattr(reviewer_outcomes, "create_langsmith_feedback", feedback)
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        finding = _finding()
+        finding.update(
+            status=status,
+            originating_tool_runs={"tool-run": start.isoformat()},
+            last_human_reply_at=(start + timedelta(seconds=age)).isoformat(),
+            last_human_reply_author="reviewer" if human else None,
+            last_human_reply_body="This finding is noise" if human else None,
+        )
+        await reviewer_outcomes.FindingDismissalFeedback.record(finding)
+        feedback.assert_awaited_once_with("tool-run", "finding_dismissed", score=expected)
+
+    @staticmethod
+    async def capture(runtime: Runtime) -> object:
+        tool = StructuredTool.from_function(
+            coroutine=reviewer_outcomes.FindingDismissalFeedback.start,
+            name="add_finding",
+            description="Record finding origins",
+        )
+        return await tool.ainvoke({})
+
+    async def test_initializes_each_matching_span(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        feedback = AsyncMock(return_value=True)
+        monkeypatch.setattr(reviewer_outcomes, "create_langsmith_feedback", feedback)
+        client = MagicMock(spec=Client)
+        tracer = LangChainTracer(client=client, project_name="test")
+        remote_id = str(uuid4())
+        remote_start = datetime(2026, 1, 1, tzinfo=UTC)
+        result = await in_graph_context(
+            {
+                "run_name": "add_finding",
+                "callbacks": [tracer],
+                "configurable": {
+                    "tool_spans": [{"run_id": remote_id, "started_at": remote_start.isoformat()}]
+                },
+            },
+            self.capture,
+        )
+        assert isinstance(result, dict)
+        assert result[remote_id] == remote_start.isoformat()
+        assert len(result) == 4
+        assert {call.args[0] for call in feedback.await_args_list} == set(result)
+        assert all(call.kwargs["score"] == 0.0 for call in feedback.await_args_list)

@@ -55,6 +55,7 @@ from rt.backend import (
 from rt.git_evidence import turn_git
 from rt.local_tools import run_locally, runs_locally
 from rt.session_handoff import HeldSessions
+from rt.tracing import TurnTrace
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,7 @@ async def _operate(
     request = _reading(spec, runtime.state).model_copy(
         update={
             "run_id": run_id(),
+            "tool_spans": await TurnTrace.tool_spans(spec.name),
             "arguments": dict(arguments),
             "request_id": tool_call_id,
             "grant": backend.grant(spec),

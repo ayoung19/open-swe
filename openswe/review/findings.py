@@ -23,7 +23,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import datetime
-from typing import Any, Literal, Self, TypedDict, cast
+from typing import Any, Literal, NotRequired, Self, TypedDict, cast
 from uuid import UUID, uuid7
 
 from langgraph_sdk import get_client
@@ -165,6 +165,7 @@ class Finding(TypedDict):
     fingerprint: str
     interactions: list[FindingInteraction]
     rank: int | None
+    originating_tool_runs: NotRequired[dict[str, str]]
 
 
 class AppendFindingResult(TypedDict):
@@ -258,6 +259,7 @@ def new_finding(
         "fingerprint": _finding_fingerprint(file, side, start_line, end_line, description),
         "interactions": [],
         "rank": None,
+        "originating_tool_runs": {},
     }
     return finding
 
@@ -584,6 +586,7 @@ class FindingRow(Base):
     resolution_note: Mapped[str | None]
     diff_hunk: Mapped[str | None]
     fingerprint: Mapped[str]
+    originating_tool_runs: Mapped[dict[str, str]] = mapped_column(JSONB, default_factory=dict)
     interaction_rows: Mapped[list[InteractionRow]] = relationship(
         default_factory=list,
         cascade="all, delete-orphan",
@@ -1003,6 +1006,15 @@ async def mutate_findings(
         await ReviewEvents(
             thread_id, PullRequestKey.of(pull.owner, pull.repo, pull.number)
         ).finding_changes(before, changed)
+    from openswe.utils.reviewer_outcomes import FindingDismissalFeedback
+
+    for finding in changed:
+        previous = before.get(finding["id"], {})
+        if (
+            finding["status"] in {"dismissed", "resolved"}
+            and previous.get("status") != finding["status"]
+        ):
+            await FindingDismissalFeedback.record(finding)
     await _record_finding_telemetry(thread_id, changed)
     return findings
 
@@ -1039,7 +1051,13 @@ async def append_finding(thread_id: str, finding: Finding) -> AppendFindingResul
                 continue
             if _current_fingerprint(existing) == fingerprint:
                 captured["finding"] = existing
-                return False
+                origins = {
+                    **existing.get("originating_tool_runs", {}),
+                    **finding.get("originating_tool_runs", {}),
+                }
+                changed = origins != existing.get("originating_tool_runs", {})
+                existing["originating_tool_runs"] = origins
+                return changed
         findings.append(finding)
         captured["finding"] = finding
         return True

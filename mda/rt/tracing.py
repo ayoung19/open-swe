@@ -12,6 +12,7 @@ from langchain_core.runnables.config import ensure_config
 from langchain_core.tracers.langchain import LangChainTracer
 from langsmith.run_trees import RunTree
 from pydantic import JsonValue
+from runtime_api.operations import ToolSpan
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,21 @@ class TurnTrace:
                 current = parent
             return current
         return None
+
+    @staticmethod
+    async def tool_spans(name: str) -> list[ToolSpan]:
+        config = ensure_config()
+        callbacks = config.get("callbacks")
+        spans: list[ToolSpan] = []
+        if isinstance(callbacks, (AsyncCallbackManager, CallbackManager)):
+            for tracer in callbacks.handlers:
+                if isinstance(tracer, LangChainTracer):
+                    span = tracer.run_map.get(str(callbacks.parent_run_id))
+                    while span is not None:
+                        if span.name == name:
+                            spans.append(ToolSpan(run_id=span.id, started_at=span.start_time))
+                        span = tracer.run_map.get(str(span.parent_run_id))
+        return spans
 
     def start(self) -> None:
         self.root = None

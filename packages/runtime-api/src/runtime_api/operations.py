@@ -4,7 +4,9 @@ An operation takes its arguments and returns its result. The tool call around it
 with its result message, errors and transcript, is the runtime's.
 """
 
+from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -17,10 +19,16 @@ class RunRequest(BaseModel):
     run_id: str | None = None
 
 
+class ToolSpan(BaseModel):
+    run_id: UUID
+    started_at: datetime
+
+
 class RunOperation(RunRequest):
     # A body that fails validation is never quoted back: it may carry credentials.
     model_config = ConfigDict(hide_input_in_errors=True)
 
+    tool_spans: list[ToolSpan] = []
     name: str
     arguments: dict[str, JsonValue] = {}
     # Identifies this call, for operations that are idempotent per request.

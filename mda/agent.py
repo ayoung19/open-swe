@@ -30,10 +30,12 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self, cast
 
+from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.subagents import SubAgent
 from langchain.agents.middleware import AgentMiddleware, configure_trace_policy
 from langchain_core.language_models import BaseChatModel
+from langchain_openai import ChatOpenAI
 from managed_deepagents import (
     DeepAgentDefinition,
     ManagedServerRuntime,
@@ -64,6 +66,7 @@ from rt.middleware import (
 )
 from rt.model_calls import model_call_guards
 from rt.models import build_model
+from rt.offload import AutomaticOffload
 from rt.remote_files import FILE_TOOLS, RemoteFiles, RunArtifacts
 from rt.run_prompt import RunPromptMiddleware, ThreadPromptMiddleware
 from rt.run_tools import (
@@ -185,10 +188,26 @@ class _Parts:
     middleware: list[AgentMiddleware]
     worker_middleware: list[AgentMiddleware]
     sandbox: SandboxDefinition
+    artifacts: BackendProtocol
 
     def sync_subagents(self, model: BaseChatModel | str) -> list[SubAgent]:
         """The graph's sync subagents, built with ``model``."""
-        return [{**subagent, "model": model} for subagent in self.subagents]
+        return [
+            {
+                **subagent,
+                "model": model,
+                "middleware": [
+                    *subagent.get("middleware", []),
+                    *self.summarization(model),
+                ],
+            }
+            for subagent in self.subagents
+        ]
+
+    def summarization(self, model: BaseChatModel | str) -> list[AgentMiddleware]:
+        if isinstance(model, ChatOpenAI):
+            return [AutomaticOffload(model, self.artifacts)]
+        return []
 
 
 def _code_mode(
@@ -297,14 +316,14 @@ def _parts(graph: Graph) -> _Parts:
     )
     timing.lap("middleware")
     timing.log(graph_name=graph, subagents=len(subagents) + 1, middleware=len(middleware))
+    artifacts = RunArtifacts(backend, run_id, lambda: backend.run.catalog.files.artifacts_root)
     return _Parts(
+        artifacts=artifacts,
         subagents=subagents,
         middleware=middleware,
         worker_middleware=[*middleware, AsyncWorkerLaunchMiddleware(backend)],
         # A run without MDA's sandbox keeps the graph's own files where its file tools are.
-        sandbox=declared_sandbox(
-            RunArtifacts(backend, run_id, lambda: backend.run.catalog.files.artifacts_root)
-        ),
+        sandbox=declared_sandbox(artifacts),
     )
 
 
@@ -338,5 +357,5 @@ def agent(inputs: GraphInputs) -> DeepAgentDefinition:
         sandbox=parts.sandbox,
         # `mda build` reads `worker`'s literal name to build its graph.
         subagents=[*sync_subagents, worker],
-        middleware=parts.worker_middleware,
+        middleware=[*parts.worker_middleware, *parts.summarization(inputs.agent_model())],
     )

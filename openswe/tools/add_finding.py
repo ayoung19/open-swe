@@ -23,6 +23,7 @@ from openswe.review.findings import (
     thread_missing_tool_result,
 )
 from openswe.run_config import RunConfig
+from openswe.utils.reviewer_outcomes import FindingDismissalFeedback
 
 
 async def add_finding(
@@ -39,6 +40,7 @@ async def add_finding(
     state: Annotated[dict[str, Any] | None, InjectedState] = None,
 ) -> dict[str, Any]:
     """Implement the `add_finding` tool."""
+    originating_tool_runs = await FindingDismissalFeedback.start()
     if start_line is not None and end_line is None:
         end_line = start_line
     if start_line is None and end_line is not None:
@@ -104,6 +106,7 @@ async def add_finding(
         in_diff=in_diff,
     )
 
+    finding["originating_tool_runs"] = originating_tool_runs
     try:
         append_result = await append_finding(thread_id, finding)
     except ReviewerThreadMissingError as exc:

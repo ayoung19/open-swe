@@ -12,16 +12,25 @@ updates in place instead of duplicating.
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from langchain_core.callbacks import AsyncCallbackManager, CallbackManager
+from langchain_core.tracers.langchain import LangChainTracer
+from langgraph.config import get_config
 from langsmith import AsyncClient as AsyncLangSmithClient
 from langsmith.utils import LangSmithNotFoundError
+from runtime_api.operations import ToolSpan
 
 from openswe.config import ENV
 from openswe.review.findings import Finding
 from openswe.run_config import RunConfig
 from openswe.utils import ttl_cache
-from openswe.utils.langsmith import async_langsmith_client, sync_langsmith_client
+from openswe.utils.langsmith import (
+    async_langsmith_client,
+    create_langsmith_feedback,
+    sync_langsmith_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,3 +289,52 @@ async def emit_finding_status_outcome(
         head_sha=head_sha,
         thread_id=thread_id,
     )
+
+
+class FindingDismissalFeedback:
+    @staticmethod
+    async def start() -> dict[str, str]:
+        try:
+            config = get_config()
+        except RuntimeError:
+            logger.debug("Finding feedback has no runtime context", exc_info=True)
+            return {}
+        origins: dict[str, str] = {}
+        for raw in config.get("configurable", {}).get("tool_spans", []):
+            span = ToolSpan.model_validate(raw)
+            origins[str(span.run_id)] = span.started_at.isoformat()
+        callbacks = config.get("callbacks")
+        if isinstance(callbacks, (AsyncCallbackManager, CallbackManager)):
+            for tracer in callbacks.handlers:
+                if isinstance(tracer, LangChainTracer):
+                    current = tracer.run_map.get(str(callbacks.parent_run_id))
+                    while current is not None:
+                        if current.name == "add_finding":
+                            origins[str(current.id)] = current.start_time.isoformat()
+                        current = tracer.run_map.get(str(current.parent_run_id))
+        for run_id in origins:
+            await create_langsmith_feedback(run_id, "finding_dismissed", score=0.0)
+        return origins
+
+    @staticmethod
+    async def record(finding: Finding) -> None:
+        dismissed_at: datetime | None = None
+        if (
+            finding.get("status") == "dismissed"
+            and finding.get("last_human_reply_author")
+            and finding.get("last_human_reply_body")
+            and (raw := finding.get("last_human_reply_at"))
+        ):
+            try:
+                dismissed_at = datetime.fromisoformat(raw).astimezone(UTC)
+            except ValueError:
+                logger.warning(
+                    "Invalid finding reply timestamp", extra={"finding_id": finding["id"]}
+                )
+        for run_id, started_at in finding.get("originating_tool_runs", {}).items():
+            start = datetime.fromisoformat(started_at).astimezone(UTC)
+            score = float(
+                dismissed_at is not None
+                and timedelta(0) <= dismissed_at - start <= timedelta(days=7)
+            )
+            await create_langsmith_feedback(run_id, "finding_dismissed", score=score)

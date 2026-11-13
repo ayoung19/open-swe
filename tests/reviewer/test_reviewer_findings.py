@@ -4,11 +4,13 @@ import asyncio
 import logging
 from typing import Any
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 
 from openswe.review.findings import (
     Finding,
+    FindingRow,
     ReviewerThreadMissingError,
     ReviewerThreadUnlinkedError,
     append_finding,
@@ -20,6 +22,7 @@ from openswe.review.findings import (
     new_finding,
     replace_findings,
     review_id_for_finding,
+    start_run_scoped_findings,
     surface_state_of,
     thread_ids_for_finding,
     update_finding_fields,
@@ -329,3 +332,21 @@ async def test_get_thread_metadata_raises_domain_error_when_thread_missing() -> 
     with patch("openswe.review.findings.get_client", return_value=fake_client):
         with pytest.raises(ReviewerThreadMissingError):
             await get_thread_metadata("tid")
+
+
+class TestFindingOrigins:
+    async def test_duplicate_findings_retain_every_tool_run(self) -> None:
+        thread_id = str(uuid4())
+        start_run_scoped_findings(thread_id)
+        first = _f(id="first", originating_tool_runs={"run-1": "2026-01-01T00:00:00+00:00"})
+        second = _f(id="second", originating_tool_runs={"run-2": "2026-01-02T00:00:00+00:00"})
+        await append_finding(thread_id, first)
+        duplicate = await append_finding(thread_id, second)
+        assert not duplicate["created"]
+        stored = await list_findings(thread_id)
+        assert len(stored) == 1
+        row = FindingRow.of(uuid4(), 0, stored[0])
+        assert row.to_finding()["originating_tool_runs"] == {
+            "run-1": "2026-01-01T00:00:00+00:00",
+            "run-2": "2026-01-02T00:00:00+00:00",
+        }

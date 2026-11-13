@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import random
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -173,12 +174,7 @@ async def proxy_dashboard_thread_commands(
     principal: Principal | None = None,
     relayed_from: str | None = None,
 ) -> tuple[int, bytes, str | None]:
-    """Forward one command, enriched for whoever sent it.
-
-    ``principal`` is how a machine gets in. Without one the sender is the person
-    named by ``login``, which is what the dashboard and the agent's own tools pass.
-    ``relayed_from`` names the agent thread that sent it on that person's behalf.
-    """
+    """Forward one command, enriched for whoever sent it."""
     received_at_ms = _now_ms()
     principal = principal or Principal.of_login(login, email)
     require_json_content_type(content_type)
@@ -301,41 +297,73 @@ async def proxy_dashboard_thread_commands(
         if method in ACTING_COMMANDS and not relayed_from
         else None
     )
-    try:
-        reply = await THREADS.command(thread_id, outgoing, user_id=sender)
-    except Exception:
-        # Answered like the runtime's own failure, so a refused start still closes its turn.
-        logger.exception("Delivering a thread command failed", extra={"thread_id": thread_id})
-        reply = CommandReply(
-            500,
-            json.dumps({"detail": "the command could not be delivered"}).encode(),
-            "application/json",
-        )
+    retry_delays = (0.25, 0.75) if method == "run.start" else ()
+    for attempt in range(len(retry_delays) + 1):
+        delivered = True
+        try:
+            reply = await THREADS.command(thread_id, outgoing, user_id=sender)
+        except Exception:
+            logger.exception("Delivering a thread command failed", extra={"thread_id": thread_id})
+            delivered = False
+            reply = CommandReply(
+                500,
+                json.dumps({"detail": "the command could not be delivered"}).encode(),
+                "application/json",
+            )
 
-    try:
-        response_payload = json.loads(reply.content) if reply.content else None
-    except json.JSONDecodeError:
-        response_payload = None
-    run_id = _extract_run_id_from_command_response(response_payload)
-    run_start_succeeded = (
-        parsed.get("method") == "run.start"
-        and reply.status in {200, 202, 204}
-        and isinstance(response_payload, dict)
-        and response_payload.get("type") == "success"
-        and run_id is not None
-    )
-    # The store answers a start the runtime refused with a 200 carrying an error envelope.
-    run_start_refused = method == "run.start" and (
-        reply.status >= 400
-        or (isinstance(response_payload, dict) and response_payload.get("type") == "error")
-    )
-    if requeueable is not None and not run_start_succeeded:
-        requeued = await _queue_if_thread_turned_busy(thread_id, login, requeueable, email=email)
-        if requeued is not None:
-            mentions.dispatch()
-            return 200, json.dumps(requeued).encode(), "application/json"
-    if run_start_refused:
-        await _fail_requested_turn(thread_id, enriched)
+        try:
+            response_payload = json.loads(reply.content) if reply.content else None
+        except json.JSONDecodeError:
+            response_payload = None
+        run_id = _extract_run_id_from_command_response(response_payload)
+        run_start_succeeded = (
+            parsed.get("method") == "run.start"
+            and reply.status in {200, 202, 204}
+            and isinstance(response_payload, dict)
+            and response_payload.get("type") == "success"
+            and run_id is not None
+        )
+        run_start_refused = method == "run.start" and (
+            reply.status >= 400
+            or (isinstance(response_payload, dict) and response_payload.get("type") == "error")
+        )
+        if requeueable is not None and not run_start_succeeded:
+            requeued = await _queue_if_thread_turned_busy(
+                thread_id, login, requeueable, email=email
+            )
+            if requeued is not None:
+                mentions.dispatch()
+                return 200, json.dumps(requeued).encode(), "application/json"
+        if not run_start_refused:
+            break
+        error_text = (
+            " ".join(
+                str(response_payload.get(field, "")) for field in ("error", "message", "detail")
+            ).lower()
+            if isinstance(response_payload, dict)
+            else ""
+        )
+        retryable = delivered and (
+            500 <= reply.status < 600
+            or any(
+                marker in error_text
+                for marker in ("lock timeout", "55p03", "failed to patch thread")
+            )
+        )
+        logger.warning(
+            "Dashboard run start refused",
+            extra={
+                "thread_id": thread_id,
+                "status_code": reply.status,
+                "attempt_count": attempt + 1,
+                "retryable": retryable,
+            },
+        )
+        if not retryable or attempt == len(retry_delays):
+            await _fail_requested_turn(thread_id, enriched)
+            break
+        delay = retry_delays[attempt]
+        await asyncio.sleep(random.uniform(delay * 0.8, delay * 1.2))
     if run_start_succeeded and not principal.machine and chats_beside_plugin(metadata):
         user = await User.for_person(ThreadIdentity(login).person)
         if user:

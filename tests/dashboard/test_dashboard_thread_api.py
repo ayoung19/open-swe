@@ -1035,34 +1035,83 @@ _REFUSED_START = json.dumps(
 
 
 @pytest.mark.parametrize(
-    ("refusal", "status_code"),
+    ("refusal", "attempts", "outcome"),
     [
-        pytest.param(httpx.ConnectError("MDA unreachable"), 500, id="undeliverable"),
+        pytest.param(httpx.ConnectError("MDA unreachable"), 1, "failed", id="undeliverable"),
         pytest.param(
             thread_proxy.CommandReply(200, _REFUSED_START, "application/json"),
-            200,
+            1,
+            "failed",
             id="runtime-refused",
         ),
+        pytest.param(
+            thread_proxy.CommandReply(403, b'{"detail":"forbidden"}', "application/json"),
+            1,
+            "failed",
+            id="forbidden",
+        ),
+        pytest.param(
+            thread_proxy.CommandReply(503, b"unavailable", "text/plain"),
+            3,
+            "failed",
+            id="exhausted-server-error",
+        ),
+        *[
+            pytest.param(
+                thread_proxy.CommandReply(
+                    200,
+                    json.dumps({"type": "error", field: text}).encode(),
+                    "application/json",
+                ),
+                attempts,
+                outcome,
+                id=f"{field}-{outcome}",
+            )
+            for field, text in [
+                (
+                    "message",
+                    '{"detail":"Failed to patch thread: canceling statement due to lock timeout"}',
+                ),
+                ("detail", "55P03"),
+            ]
+            for attempts, outcome in [(2, "started"), (3, "failed"), (1, "queued")]
+        ],
     ],
 )
 async def test_proxy_commands_closes_the_turn_of_a_start_that_did_not_start(
-    monkeypatch, refusal: Exception | thread_proxy.CommandReply, status_code: int
+    monkeypatch,
+    refusal: Exception | thread_proxy.CommandReply,
+    attempts: int,
+    outcome: str,
 ) -> None:
     turn_id = uuid7()
+    posted: list[bytes] = []
+    success = {"type": "success", "result": {"run_id": "run-1"}}
 
     class UndeliverableThreads(ThreadStoreOverClient):
         async def command(
             self, thread_id: str, body: bytes, *, user_id: str | None = None
         ) -> thread_proxy.CommandReply:
+            posted.append(body)
+            if outcome == "started" and len(posted) == attempts:
+                return thread_proxy.CommandReply(
+                    200, json.dumps(success).encode(), "application/json"
+                )
             if isinstance(refusal, Exception):
                 raise refusal
             return refusal
 
     class IdleThreads:
         async def get(self, thread_id: str) -> dict[str, object]:
-            return {"thread_id": thread_id, "status": "idle", "metadata": {"owner_login": "ada"}}
+            return {
+                "thread_id": thread_id,
+                "status": "busy" if outcome == "queued" and posted else "idle",
+                "metadata": {"owner_login": "ada"},
+            }
 
-    async def enrich(thread_id: str, login: str, command: dict[str, object], **kwargs) -> dict:
+    async def enrich(
+        thread_id: str, login: str, command: dict[str, object], **kwargs: object
+    ) -> dict[str, object]:
         return {
             "method": "run.start",
             "params": {"config": {"configurable": {"transcript_turn_id": str(turn_id)}}},
@@ -1070,21 +1119,38 @@ async def test_proxy_commands_closes_the_turn_of_a_start_that_did_not_start(
 
     failed = AsyncMock()
     notify = AsyncMock()
+    queued = AsyncMock(return_value=success)
     monkeypatch.setattr(thread_proxy.ThreadMentions, "notify", notify)
     patch_thread_module(
         monkeypatch, "langgraph_client", lambda: SimpleNamespace(threads=IdleThreads())
     )
-    patch_thread_module(monkeypatch, "THREADS", UndeliverableThreads())
+    threads = UndeliverableThreads()
+    monkeypatch.setattr(threads, "update", AsyncMock())
+    patch_thread_module(monkeypatch, "THREADS", threads)
     monkeypatch.setattr(thread_proxy, "_enrich_run_start_command", enrich)
     monkeypatch.setattr(thread_proxy, "fail_unstarted_turn", failed)
+    monkeypatch.setattr(thread_proxy, "queue_follow_up_run", queued)
+    monkeypatch.setattr(thread_proxy._SlackWebHandoff, "notify", AsyncMock())
+    monkeypatch.setattr(thread_proxy, "_observe_dashboard_run_ttft", AsyncMock())
 
-    status, _, _ = await thread_proxy.proxy_dashboard_thread_commands(
+    status, content, _ = await thread_proxy.proxy_dashboard_thread_commands(
         "tid", "ada", b'{"method": "run.start", "params": {}}'
     )
 
-    assert status == status_code
-    failed.assert_awaited_once_with("tid", turn_id, error="the message could not be started")
-    notify.assert_not_awaited()
+    assert len(posted) == attempts
+    assert all(body == posted[0] for body in posted)
+    if outcome == "failed":
+        assert status == (500 if isinstance(refusal, Exception) else refusal.status)
+        failed.assert_awaited_once_with("tid", turn_id, error="the message could not be started")
+        notify.assert_not_awaited()
+    else:
+        assert status == 200
+        assert json.loads(content) == success
+        failed.assert_not_awaited()
+    if outcome == "queued":
+        queued.assert_awaited_once()
+    else:
+        queued.assert_not_awaited()
 
 
 async def test_proxy_commands_rejects_non_admin_on_admin_thread(monkeypatch) -> None:

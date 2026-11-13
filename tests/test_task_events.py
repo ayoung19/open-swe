@@ -164,9 +164,15 @@ async def test_worker_failure_details_return_to_its_task_coordinator(
     assert display.content in content
 
 
-@pytest.mark.parametrize("is_message", [False, True])
+@pytest.mark.parametrize(
+    ("is_message", "worker_thread_id"),
+    [(False, None), (True, None), (True, _WORKER), (True, _COORDINATOR), (True, str(uuid4()))],
+)
 async def test_worker_text_cannot_close_its_untrusted_boundary(
-    worker_context: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, is_message: bool
+    worker_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    is_message: bool,
+    worker_thread_id: str | None,
 ) -> None:
     from openswe.input_messages import input_message_text
     from openswe.tasks import service
@@ -186,7 +192,7 @@ async def test_worker_text_cannot_close_its_untrusted_boundary(
         await service.message_task_thread(
             service.Actor(_WORKER, "owner"),
             message=payload,
-            worker_thread_id=None,
+            worker_thread_id=worker_thread_id,
             request_id="message",
         )
     else:
@@ -197,6 +203,7 @@ async def test_worker_text_cannot_close_its_untrusted_boundary(
             {"values": {"messages": [{"type": "ai", "content": payload}]}},
         )
     task, recipient, delivery_id, content = notify.await_args.args
+    assert recipient == _COORDINATOR
     display = notify.await_args.kwargs["task_event"]
     match = TaskMessage(
         thread_id=recipient,

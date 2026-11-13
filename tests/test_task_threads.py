@@ -741,7 +741,7 @@ async def test_finished_worker_can_receive_follow_up_and_gain_a_sibling(
         await service.message_task_thread(
             service.Actor(sender, OWNER),
             message=report,
-            worker_thread_id=None,
+            worker_thread_id=sender,
             request_id="report",
         )
     assert len(client.created_runs) == 1

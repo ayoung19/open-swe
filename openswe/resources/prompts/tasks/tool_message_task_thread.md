@@ -2,7 +2,7 @@ Send an explicit, durable coordination message without interrupting the recipien
 Only the coordinator's owner may send instructions to its workers, which run under the owner's identity.
 Other participants may inspect status but cannot send worker instructions.
 A coordinator must choose worker_thread_id from its own task: answer actionable worker questions here, and message each affected worker when a decision applies to several.
-A worker's owner omits worker_thread_id to reach its permanent coordinator.
+As a worker, omit worker_thread_id to reach your permanent coordinator; worker calls always route there.
 Use this for questions, blockers, dependencies, shared-state conflicts, explicitly requested progress, or a material development that changes the plan.
 Do not use it for routine acknowledgments, repeated findings, or a separate completion report; final answers and failures are delivered automatically.
 Busy threads receive messages before a later model call; idle threads are woken.

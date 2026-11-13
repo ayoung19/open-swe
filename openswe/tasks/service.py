@@ -676,8 +676,6 @@ async def message_task_thread(
         await owned_worker(actor, worker_thread_id)
         recipient = worker_thread_id
     else:
-        if worker_thread_id is not None:
-            raise PermissionError("Workers can only message their coordinator")
         recipient = context.task.require_coordinator()
         await authorized_metadata(actor, recipient)
     await record_event(

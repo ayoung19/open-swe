@@ -132,7 +132,7 @@ def _set_config(
     monkeypatch.setattr(opr, "get_config", lambda: {"configurable": configurable}, raising=False)
 
 
-def _open(base: str = "main") -> dict[str, Any]:
+def _open(base: str = "main", *, draft: bool = True) -> dict[str, Any]:
     return asyncio.run(
         opr._open_pull_request(
             owner="langchain-ai",
@@ -141,7 +141,7 @@ def _open(base: str = "main") -> dict[str, Any]:
             base=base,
             title="feat: x",
             body="body",
-            draft=True,
+            draft=draft,
         )
     )
 
@@ -212,8 +212,14 @@ def test_public_pr_cannot_use_requester_authority_outside_workspace(
         assert all(request.headers["Authorization"] != "Bearer alice-token" for request in requests)
 
 
-def test_profile_draft_preference_overrides_tool_argument(monkeypatch: pytest.MonkeyPatch) -> None:
-    _set_config(monkeypatch, {"source": "slack", "github_login": "johannes117", "draft_prs": False})
+@pytest.mark.parametrize(
+    ("preference", "requested", "expected"),
+    [(None, False, False), (None, True, True), (True, False, True), (False, True, False)],
+)
+def test_profile_draft_preference_overrides_tool_argument(
+    monkeypatch: pytest.MonkeyPatch, preference: bool | None, requested: bool, expected: bool
+) -> None:
+    _set_config(monkeypatch, {"source": "api", "draft_prs": preference})
     _stub_token(monkeypatch)
     client = _FakeClient(
         post=_FakeResponse(
@@ -223,10 +229,15 @@ def test_profile_draft_preference_overrides_tool_argument(monkeypatch: pytest.Mo
     )
     _install_client(monkeypatch, client)
 
-    result = _open()
+    result = _open(draft=requested)
 
     assert result["success"] is True
-    assert client.post_calls[0]["json"]["draft"] is False
+    assert client.post_calls[0]["json"]["draft"] is expected
+    assert result["draft"] is expected
+    if expected != requested:
+        assert "explicit profile preference" in result["note"]
+    else:
+        assert "note" not in result
 
 
 @pytest.mark.parametrize("stored", [True, False, None, "slow", "error"])
@@ -753,7 +764,7 @@ def test_ask_pr_requires_user_repo_access_before_using_app(monkeypatch, allowed)
         return "requester-token", "user"
 
     monkeypatch.setattr(opr, "_resolve_pr_author_token", requester_token)
-    asyncio.run(
+    result = asyncio.run(
         opr._open_pull_request(
             owner="langchain-ai",
             repo="open-swe",
@@ -761,11 +772,14 @@ def test_ask_pr_requires_user_repo_access_before_using_app(monkeypatch, allowed)
             base="main",
             title="fix: x",
             body="body",
-            draft=True,
+            draft=False,
             author="other-participant",
         )
     )
     if allowed:
+        assert result["draft"] is True
+        assert "Ask-channel" in result["note"]
+        assert "profile" not in result["note"]
         assert client.post_calls[0]["headers"]["Authorization"] == "Bearer app-token"
         assert client.post_calls[0]["json"]["draft"] is True
         assert "Requested by @alice" in client.post_calls[0]["json"]["body"]

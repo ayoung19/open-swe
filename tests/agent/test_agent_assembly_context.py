@@ -337,8 +337,12 @@ def _main_model(agent: dict[str, object]) -> ModelChoice:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "profile", [None, {}, {"draft_prs": "true"}, {"draft_prs": True}, {"draft_prs": False}]
+)
 async def test_existing_thread_reloads_sender_draft_preference_into_run_config(
     saved_thread_scope,
+    profile: dict[str, object] | None,
 ) -> None:
     saved_thread_scope["owner_login"] = "draft-preference-owner"
     config = _base_config()
@@ -346,16 +350,19 @@ async def test_existing_thread_reloads_sender_draft_preference_into_run_config(
     assert isinstance(configurable, dict)
     configurable["github_login"] = "draft-preference-owner"
 
+    configurable["draft_prs"] = True
     await _agent_catalog(
         config,
-        profile={"draft_prs": False},
+        profile=profile,
         thread_settings={
             "owner_login": "draft-preference-owner",
             "model_id": "openai:gpt-6.1-sol",
         },
     )
 
-    assert configurable["draft_prs"] is False
+    value = profile.get("draft_prs") if profile else None
+    expected = value if isinstance(value, bool) else None
+    assert configurable["draft_prs"] is expected
 
 
 @pytest.mark.asyncio

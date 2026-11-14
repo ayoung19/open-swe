@@ -1209,7 +1209,7 @@ class PrepareAgentRunMiddleware(BasePrepareRunMiddleware):
         self._effort = cfg.resolved_agent_effort
         self._source = cfg.source or "dashboard"
         self._user_email = cfg.user_email or ""
-        self._draft_prs = cfg.draft_prs is True
+        self._draft_prs = cfg.draft_prs
         self._admin_workspaces = turn.admin_workspaces
         self._sole_writer = turn.sole_writer
         self._routing_defaults = dict(turn.route_models)
@@ -1916,7 +1916,8 @@ async def agent_catalog(config: RunnableConfig, surface: ToolSurface) -> None:
 
     async with aphase(thread_id, "factory.sender_profile"):
         sender_profile = profile if profile is not None else await _cached_profile(profile_login)
-    sender_draft_prs = profile_draft_prs(sender_profile)
+    sender_draft_prs = sender_profile.get("draft_prs") if sender_profile else None
+    sender_draft_prs = sender_draft_prs if isinstance(sender_draft_prs, bool) else None
     try:
         if cfg.source != "incidents_agent":
             indexed = await THREADS.get(thread_id)

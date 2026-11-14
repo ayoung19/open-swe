@@ -1204,13 +1204,20 @@ async def _open_pull_request(
             await _maybe_append_references(client, token, owner, repo, body),
             state,
         )
-        draft = True if ask_channel else preference.value
+        effective_draft = True if ask_channel else preference.value
+        draft_note = None
+        if effective_draft != draft:
+            draft_note = (
+                "Ask-channel pull requests must be drafts."
+                if ask_channel
+                else "The requester's explicit profile preference overrides the requested draft status."
+            )
         payload = {
             "title": title,
             "head": head,
             "base": base,
             "body": body,
-            "draft": draft,
+            "draft": effective_draft,
         }
         from openswe.dashboard.workspace_settings_cache import cached_workspace_settings
 
@@ -1250,6 +1257,8 @@ async def _open_pull_request(
             return {
                 "success": True,
                 "created": True,
+                "draft": effective_draft,
+                **({"note": draft_note} if draft_note else {}),
                 "url": pr.get("html_url"),
                 "number": pr.get("number"),
                 "author": (pr.get("user") or {}).get("login"),

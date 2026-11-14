@@ -235,8 +235,9 @@ async def test_public_scope_resolves_profile_via_installation_token(
     assert prepare_harness["recorded"]["github_user_id"] == 99
 
 
+@pytest.mark.parametrize("draft_preference", [None, True, False])
 async def test_a_thread_keeps_its_system_prompt_while_each_turn_says_where_it_came_from(
-    prepare_harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    prepare_harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch, draft_preference: bool | None
 ) -> None:
     """Any change to the system prompt misses the model provider's cache for the whole thread."""
     monkeypatch.setattr(server, "construct_system_prompt", construct_system_prompt)
@@ -249,9 +250,11 @@ async def test_a_thread_keeps_its_system_prompt_while_each_turn_says_where_it_ca
     runtime = cast(Runtime[Any], MagicMock())
     asked = HumanMessage(content="Fix the login", id="human-1")
 
-    from_slack = await _middleware(_slack_config())._prepare(
+    config = _slack_config(draft_prs=draft_preference)
+    from_slack = await _middleware(config)._prepare(
         cast(PrepareRunState, {"messages": [asked]}), runtime
     )
+    assert config["configurable"]["draft_prs"] is draft_preference
     said = cast(list[dict[str, str]], from_slack["messages"])
     first_reset = backend._git_identity_pending
     assert first_reset is not None

@@ -15,7 +15,6 @@ from functools import partial
 from typing import Any, NotRequired
 
 from deepagents.backends.protocol import BackendProtocol, SandboxBackendProtocol
-from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
@@ -44,7 +43,7 @@ from openswe.runtime import (
     get_cached_sandbox_backend,
 )
 from openswe.sandboxes.repo_prep import ReviewRepoPreparationError, prepare_review_repo_or_raise
-from openswe.sandboxes.tool_runtime import ModelChoice, SurfaceModels, SurfaceSubagent, ToolSurface
+from openswe.sandboxes.tool_runtime import ModelChoice, SurfaceModels, ToolSurface
 from openswe.tools.plan_walkthrough import (
     walkthrough_move_to_other,
     walkthrough_plan_chunk,
@@ -316,10 +315,3 @@ async def review_scout_catalog(config: RunnableConfig, surface: ToolSurface) -> 
 
     surface.base_tools = scout_tools()
     surface.models = models
-    surface.subagents = [
-        SurfaceSubagent(
-            name=GENERAL_PURPOSE_SUBAGENT["name"],
-            description=GENERAL_PURPOSE_SUBAGENT["description"],
-            system_prompt=GENERAL_PURPOSE_SUBAGENT["system_prompt"],
-        )
-    ]

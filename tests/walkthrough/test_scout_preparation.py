@@ -5,6 +5,28 @@ from langgraph.runtime import Runtime
 
 from openswe.review_scout import graph
 from openswe.sandboxes.repo_prep import ReviewRepoPreparationError
+from openswe.sandboxes.tool_runtime import ModelChoice, SurfaceModels, ToolSurface
+
+
+class TestScoutCatalog:
+    async def test_scout_plans_without_subagents(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        choice = ModelChoice("openai:gpt-6.1-sol", {})
+        monkeypatch.setattr(
+            graph,
+            "scout_models",
+            AsyncMock(return_value=SurfaceModels(main=choice, subagent=choice, use_gateway=False)),
+        )
+        surface = ToolSurface()
+
+        await graph.review_scout_catalog({"configurable": {"thread_id": "scout"}}, surface)
+        await surface.prepare()
+
+        assert not surface.subagents
+        assert {
+            "walkthrough_plan_chunk",
+            "walkthrough_split_hunks",
+            "walkthrough_move_to_other",
+        } <= (surface.tools.keys())
 
 
 @pytest.mark.parametrize(

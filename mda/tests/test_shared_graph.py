@@ -66,6 +66,7 @@ from rt import search_tools
 from rt.backend import Run, current_run
 from rt.managed_sandbox import PROXY_WRITE_BACKOFF_SECONDS, definition, opened_sandbox
 from rt.outbox import Outbox
+from rt.remote_files import RemoteFiles
 from rt.run_tools import ModelHandler, RunCodeInterpreter
 from rt.sandbox_setup import SandboxUnavailableError
 from runtime_api.catalog import (
@@ -323,6 +324,60 @@ async def test_every_run_and_read_shares_one_graph_and_calls_the_backend_as_itse
     assert set(read.channels) == set(first.channels)
     # Code mode's and the run's skills' state, which every graph has.
     assert {"_quickjs_snapshot_payload", "skills_metadata"} <= set(read.channels)
+
+
+class TestScoutTools:
+    def bind(self, tools: list[BaseTool], **kwargs: object) -> GenericFakeChatModel:
+        self.offered.append({tool.name for tool in tools})
+        return self.model
+
+    @pytest.mark.parametrize("with_subagent", [False, True])
+    async def test_scout_reads_and_plans_with_its_catalogs_tools(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        backend_calls: BackendCalls,
+        with_subagent: bool,
+    ) -> None:
+        self.offered: list[set[str]] = []
+        self.model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            ToolCall(name="execute", args={"command": "git diff"}, id="read-diff")
+                        ],
+                    ),
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            ToolCall(name="walkthrough_plan_chunk", args={}, id="plan-chunk")
+                        ],
+                    ),
+                    AIMessage(content="done"),
+                ]
+            )
+        )
+        monkeypatch.setattr(
+            RemoteFiles,
+            "aexecute",
+            AsyncMock(return_value=ExecuteResponse(output="-old\n+new", exit_code=0)),
+        )
+        monkeypatch.setattr(GenericFakeChatModel, "bind_tools", self.bind)
+        monkeypatch.setattr(agent, "_DEFAULT_MODEL", self.model)
+        catalog = _catalog("walkthrough_plan_chunk", "plan-grant")
+        if not with_subagent:
+            catalog = catalog.model_copy(update={"subagents": []})
+
+        await _run(InMemoryStore(), "scout", _context("review-scout", "scout-token", catalog))
+
+        assert self.offered
+        for names in self.offered:
+            assert ("task" in names) is with_subagent
+            assert {"read_file", "execute", "walkthrough_plan_chunk"} <= names
+        assert [operation for _, _, operation in backend_calls if operation] == [
+            "walkthrough_plan_chunk:plan-grant",
+        ]
 
 
 async def test_each_run_on_the_shared_graph_works_in_its_own_threads_sandbox(

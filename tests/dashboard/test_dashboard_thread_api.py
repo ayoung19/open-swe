@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -226,7 +225,7 @@ async def test_create_session_uses_selected_workspace_personal_default(
 
 def _image() -> thread_runs.DashboardImageBody:
     return thread_runs.DashboardImageBody(
-        base64=base64.b64encode(b"image").decode("ascii"),
+        base64="iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGP8z8DAwMAAAAYIAQHLR3Z1AAAAAElFTkSuQmCC",
         mimeType="image/png",
     )
 

@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import socket
 import uuid
+from io import BytesIO
 from typing import cast
 
 import httpx
+import httpx2
 import pytest
 import rt.images as images
 import rt.linear as linear
@@ -25,6 +28,7 @@ from managed_deepagents import (
 from managed_deepagents._channels.http.endpoint import EndpointClient
 from managed_deepagents._channels.http.types import ChannelName
 from managed_deepagents._channels.run_input import normalize_run_inputs
+from PIL import Image
 from pydantic import BaseModel, TypeAdapter
 from rt.intake import ask_backend, backend_endpoint
 from runtime_api.endpoint import Endpoint
@@ -628,3 +632,20 @@ async def test_a_linked_image_is_fetched_only_over_https_from_a_public_address(
         lambda *_args, **_kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))],
     )
     assert await images.fetch_image_block(url) is None
+
+
+async def test_linked_images_are_normalized_before_entering_the_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = BytesIO()
+    Image.new("RGB", (4000, 1000)).save(output, format="PNG")
+
+    async def get(url: str) -> tuple[httpx2.Response, bytes]:
+        return httpx2.Response(200, headers={"Content-Type": "image/png"}), output.getvalue()
+
+    monkeypatch.setattr(images, "_get", get)
+    block = await images.fetch_image_block("https://uploads.example/a.png")
+    assert block is not None and block["type"] == "image"
+    with Image.open(BytesIO(base64.b64decode(block["base64"]))) as image:
+        assert image.size == (2000, 500)
+        assert image.format == "PNG"

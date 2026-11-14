@@ -4,9 +4,11 @@
 for each case, with and without a bot username; ``mda/`` tests can't import the backend.
 """
 
+import base64
 import json
 import re
 from collections.abc import Mapping
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -14,6 +16,7 @@ from xml.etree import ElementTree
 import pytest
 import rt.slack_prompt as slack_prompt
 from managed_deepagents._channels.types import ChannelError
+from PIL import Image
 
 _BACKEND = json.loads((Path(__file__).parent / "slack_prompt_backend.json").read_text())
 _SETS = {"dispatched_timestamps", "run_described_person_ids"}
@@ -455,6 +458,8 @@ async def test_slack_files_are_fetched_with_the_bot_token_and_others_without(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fetched: list[tuple[str, str]] = []
+    output = BytesIO()
+    Image.new("RGB", (4000, 1000)).save(output, format="PNG")
 
     async def slack_file(url: str, token: str) -> Any:
         fetched.append((url, token))
@@ -462,7 +467,7 @@ async def test_slack_files_are_fetched_with_the_bot_token_and_others_without(
         class _Response:
             headers = {"Content-Type": "image/png"}
 
-        return _Response(), b"png"
+        return _Response(), output.getvalue()
 
     async def other(url: str) -> Any:
         fetched.append((url, ""))
@@ -483,3 +488,6 @@ async def test_slack_files_are_fetched_with_the_bot_token_and_others_without(
         ("https://img.example/b.png", ""),
     ]
     assert [block["type"] for block in blocks] == ["image"]
+    assert blocks[0]["type"] == "image"
+    with Image.open(BytesIO(base64.b64decode(blocks[0]["base64"]))) as image:
+        assert image.size == (2000, 500)

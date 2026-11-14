@@ -20,6 +20,7 @@ from langchain_core.messages.content import (
     create_image_block,
     create_text_block,
 )
+from runtime_api.images import ImageData
 
 from rt.public_http import PublicOrigin
 
@@ -97,6 +98,11 @@ async def fetch_image_block(url: str) -> ImageContentBlock | TextContentBlock | 
             extra={"content_type": content_type},
         )
         return None
+    try:
+        image = await ImageData.normalize(content, content_type)
+    except ValueError:
+        logger.warning("An attached image could not be decoded; skipping it", exc_info=True)
+        return None
     return create_image_block(
-        base64=base64.b64encode(content).decode("ascii"), mime_type=content_type
+        base64=base64.b64encode(image.data).decode("ascii"), mime_type=image.mime_type
     )

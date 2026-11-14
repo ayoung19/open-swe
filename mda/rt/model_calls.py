@@ -36,6 +36,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 from langchain_fireworks import ChatFireworks
 from langchain_openai import ChatOpenAI
+from runtime_api.images import ImageData
 from runtime_api.model_errors import MODEL_FAILURE_REPLY_KEY, classify_exception, exception_fields
 from runtime_api.models import MODEL_CALL_BUDGET
 
@@ -327,7 +328,26 @@ class ReplayableHistoryMiddleware(_ModelCallGuard):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
         model = _chat_model(request.model)
-        messages = [_for_provider(message, model) for message in _in_call_order(request.messages)]
+        messages: list[AnyMessage] = []
+        for message in _in_call_order(request.messages):
+            prepared = _for_provider(message, model)
+            if isinstance(prepared.content, list):
+                content: list[str | dict[str, object]] = []
+                for block in prepared.content:
+                    try:
+                        content.append(
+                            await ImageData.normalize_block(block)
+                            if isinstance(block, dict)
+                            else block
+                        )
+                    except ValueError:
+                        logger.warning("An image in history could not be decoded", exc_info=True)
+                        content.append(
+                            {"type": "text", "text": "An attached image could not be decoded."}
+                        )
+                if content != prepared.content:
+                    prepared = prepared.model_copy(update={"content": content})
+            messages.append(prepared)
         if any(a is not b for a, b in zip(messages, request.messages, strict=True)):
             request = request.override(messages=messages)
         return await handler(request)

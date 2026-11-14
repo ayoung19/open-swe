@@ -13,6 +13,7 @@ from langchain_core.messages.content import (
     create_image_block,
     create_text_block,
 )
+from runtime_api.images import ImageData
 
 from openswe.config import ENV
 from openswe.slack.http import required_slack_value
@@ -114,7 +115,8 @@ async def fetch_image_block(
                 "An attached image was skipped because it exceeded the 10 MiB size limit."
             )
 
-        encoded = base64.b64encode(response.content).decode("ascii")
+        image = await ImageData.normalize(response.content, content_type)
+        encoded = base64.b64encode(image.data).decode("ascii")
         logger.info(
             "Fetched image %s (%s, %d bytes)",
             image_url,

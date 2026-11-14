@@ -1,7 +1,9 @@
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Awaitable, Callable
 from copy import deepcopy
 from datetime import timedelta
+from io import BytesIO
 from typing import Protocol, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -31,6 +33,7 @@ from langchain_core.messages import (
 from langchain_core.tools import tool
 from langchain_fireworks import ChatFireworks
 from langchain_openai import ChatOpenAI
+from PIL import Image
 from pydantic import SecretStr
 from rt.backend import Run, RunContext
 from rt.middleware import BackendRunMiddleware, ModelCall
@@ -802,3 +805,77 @@ async def test_cancelling_retry_backoff_does_not_start_another_model_attempt(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert handler.await_count == 1
+
+
+@pytest.mark.parametrize("representation", ["url", "url_dict", "native", "anthropic"])
+async def test_history_with_many_images_is_resized_without_losing_content(
+    representation: str,
+) -> None:
+    output = BytesIO()
+    Image.new("RGB", (1000, 4000)).save(output, format="JPEG")
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    url = f"data:image/jpeg;base64,{encoded}"
+    blocks = {
+        "url": {"type": "image_url", "image_url": url},
+        "url_dict": {"type": "image_url", "image_url": {"url": url, "detail": "high"}},
+        "native": {"type": "image", "base64": encoded, "mime_type": "image/jpeg"},
+        "anthropic": {
+            "type": "image",
+            "source": {"type": "base64", "data": encoded, "media_type": "image/jpeg"},
+        },
+    }
+    output = BytesIO()
+    Image.new("RGB", (20, 10)).save(output, format="PNG")
+    small = {
+        "type": "image",
+        "base64": base64.b64encode(output.getvalue()).decode("ascii"),
+        "mime_type": "image/png",
+    }
+    original = HumanMessage(
+        content=[
+            {"type": "text", "text": "Inspect these"},
+            blocks[representation],
+            *[small for _ in range(21)],
+        ]
+    )
+    followup = HumanMessage(content="Continue")
+    before = deepcopy(original)
+    forwarded = await _forwarded(ReplayableHistoryMiddleware(), [original, followup], _ANTHROPIC)
+    assert original == before
+    assert forwarded.messages[1] is followup
+    content = forwarded.messages[0].content
+    assert isinstance(content, list) and len(content) == 23
+    assert content[0] == original.content[0]
+    assert content[2:] == [small] * 21
+    block = content[1]
+    assert isinstance(block, dict)
+    if representation == "native":
+        resized = block["base64"]
+    elif representation == "anthropic":
+        resized = block["source"]["data"]
+    else:
+        value = block["image_url"]
+        value = value["url"] if isinstance(value, dict) else value
+        resized = value.split(",")[1]
+        if representation == "url_dict":
+            assert block["image_url"]["detail"] == "high"
+    with Image.open(BytesIO(base64.b64decode(resized))) as image:
+        assert image.size == (500, 2000)
+        assert image.format == "JPEG"
+
+
+@pytest.mark.parametrize("encoded", ["invalid base64", "bm90IGFuIGltYWdl"])
+async def test_invalid_historical_image_does_not_poison_the_next_call(encoded: str) -> None:
+    original = HumanMessage(
+        content=[
+            {"type": "text", "text": "Inspect this"},
+            {"type": "image", "base64": encoded, "mime_type": "image/png"},
+        ]
+    )
+    forwarded = await _forwarded(ReplayableHistoryMiddleware(), [original], _ANTHROPIC)
+    content = forwarded.messages[0].content
+    assert isinstance(content, list)
+    assert content == [
+        original.content[0],
+        {"type": "text", "text": "An attached image could not be decoded."},
+    ]

@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 from fastapi import HTTPException
 from langchain_core.messages.content import ImageContentBlock, create_image_block
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from runtime_api.images import ImageData
 from runtime_api.provenance import Provenance
 
 from openswe.bridge.store import Bridge, BridgeStore, SandboxBridgeBinding
@@ -203,19 +204,23 @@ def _with_vision_fallback(model_id: str, effort: str, *, has_images: bool) -> tu
     return fallback_model_id, fallback_effort
 
 
-def _decode_dashboard_image(image: DashboardImageBody) -> bytes:
+async def _decode_dashboard_image(image: DashboardImageBody) -> bytes:
     if image.mime_type not in _SUPPORTED_IMAGE_MIME_TYPES:
         raise HTTPException(422, f"unsupported image type: {image.mime_type}")
     try:
         data = base64.b64decode(image.base64, validate=True)
-    except binascii.Error as exc:
+    except (binascii.Error, ValueError) as exc:
         raise HTTPException(422, "invalid image data") from exc
     if len(data) > _MAX_DASHBOARD_IMAGE_BYTES:
         raise HTTPException(422, "image exceeds 10MB limit")
-    return data
+    try:
+        image_data = await ImageData.normalize(data, image.mime_type)
+    except ValueError as exc:
+        raise HTTPException(422, "invalid image data") from exc
+    return image_data.data
 
 
-def _image_blocks(
+async def _image_blocks(
     images: list[DashboardImageBody], *, model_id: str | None
 ) -> list[ImageContentBlock]:
     if len(images) > _MAX_DASHBOARD_IMAGES:
@@ -225,14 +230,14 @@ def _image_blocks(
         raise HTTPException(422, f"model {model_label} does not support image input")
     return [
         create_image_block(
-            base64=base64.b64encode(_decode_dashboard_image(image)).decode("ascii"),
+            base64=base64.b64encode(await _decode_dashboard_image(image)).decode("ascii"),
             mime_type=image.mime_type,
         )
         for image in images
     ]
 
 
-def _user_message_content(
+async def _user_message_content(
     prompt: str, images: list[DashboardImageBody], *, model_id: str | None = None
 ) -> str | list[ImageContentBlock | dict[str, str]]:
     text = prompt.strip()
@@ -241,7 +246,7 @@ def _user_message_content(
     if not images:
         return text
     return [
-        *_image_blocks(images, model_id=model_id),
+        *await _image_blocks(images, model_id=model_id),
         *([{"type": "text", "text": text}] if text else []),
     ]
 
@@ -304,7 +309,7 @@ async def create_dashboard_thread_record(
     )
     if prompt is not None:
         prompt = prompt.strip()
-        _user_message_content(prompt, images or [], model_id=resolved_model)
+        await _user_message_content(prompt, images or [], model_id=resolved_model)
     else:
         prompt = ""
     chosen_model, chosen_effort = normalize_model_choice(model_id, effort)
@@ -707,14 +712,10 @@ def _dashboard_images_from_content(content: Any) -> list[DashboardImageBody]:
     return images
 
 
-def _transcript_attachments(
+async def _transcript_attachments(
     images: list[DashboardImageBody], message_id: str
 ) -> tuple[list[MessageAttachment], tuple[PendingAttachment, ...]]:
-    """Attachment rows for a command's images, and the metadata the event carries.
-
-    ``_decode_dashboard_image`` re-applies the type allowlist and the 10MB cap
-    the run already validated, so nothing reaches the database unchecked.
-    """
+    """Validated attachment rows and metadata for a command's images."""
     metadata: list[MessageAttachment] = []
     pending: list[PendingAttachment] = []
     for position, image in enumerate(images):
@@ -726,7 +727,7 @@ def _transcript_attachments(
                 position=position,
                 mime_type=image.mime_type,
                 file_name=image.file_name,
-                data=_decode_dashboard_image(image),
+                data=await _decode_dashboard_image(image),
             )
         )
         metadata.append(
@@ -739,11 +740,19 @@ def _transcript_attachments(
     return metadata, tuple(pending)
 
 
-def _validate_command_images(content: Any, *, model_id: str | None) -> None:
-    """Reject images for text-only models / oversize attachments (raises 422)."""
+async def _validate_command_images(content: object, *, model_id: str | None) -> None:
+    """Validate and normalize dashboard images in place before delivery."""
+    if not isinstance(content, list):
+        return
     images = _dashboard_images_from_content(content)
     if images:
-        _image_blocks(images, model_id=model_id)
+        await _image_blocks(images, model_id=model_id)
+        for index, block in enumerate(content):
+            if isinstance(block, dict):
+                try:
+                    content[index] = await ImageData.normalize_block(block)
+                except ValueError as exc:
+                    raise HTTPException(422, "invalid image data") from exc
 
 
 async def _resolve_sandbox_bridge(requested: object, *, owner_id: str) -> Bridge | None:
@@ -1121,7 +1130,7 @@ async def _enrich_run_start_command(
                 run_model, run_effort = _with_vision_fallback(
                     run_model, run_effort, has_images=True
                 )
-            _validate_command_images(content, model_id=run_model)
+        await _validate_command_images(content, model_id=run_model)
 
         prior = await history if history is not None else _ThreadHistory()
         profile = await profile_read or {}
@@ -1213,7 +1222,7 @@ async def _enrich_run_start_command(
             # deduplicates it — and the run then has to join the turn that was
             # recorded the first time rather than one nothing was written under.
             command_id = f"message:{message_id}:requested"
-            attachments, pending = _transcript_attachments(command_images, message_id)
+            attachments, pending = await _transcript_attachments(command_images, message_id)
             attachments.extend(context_attachments)
             appended = await append(
                 thread_id,
@@ -1366,8 +1375,12 @@ async def steer_running_thread(
         _run_metadata(client, thread_id, live_run_id), _ThreadHistory.of(thread_id)
     )
     run_model = live_run_metadata.get(RUN_MODEL_KEY)
-    image_blocks = _image_blocks(
-        command_images,
+    await _validate_command_images(
+        content,
+        model_id=run_model if isinstance(run_model, str) else thread_model_choice(metadata)[0],
+    )
+    image_blocks = await _image_blocks(
+        _dashboard_images_from_content(content),
         model_id=run_model if isinstance(run_model, str) else thread_model_choice(metadata)[0],
     )
 
@@ -1390,7 +1403,7 @@ async def steer_running_thread(
 
     if turn is not None:
         turn_id = turn.turn_id
-        attachments, pending = _transcript_attachments(command_images, message_id)
+        attachments, pending = await _transcript_attachments(command_images, message_id)
         await append(
             thread_id,
             [
